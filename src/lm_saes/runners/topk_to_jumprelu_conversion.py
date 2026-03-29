@@ -1,33 +1,34 @@
 """Module for sweeping SAE experiments."""
 
-from pathlib import Path
 from typing import Optional
 
 import torch
 from pydantic_settings import BaseSettings
 from torch.distributed.device_mesh import init_device_mesh
 
-from lm_saes.activation.factory import ActivationFactory, ActivationFactoryConfig
-from lm_saes.backend.language_model import LanguageModelConfig
-from lm_saes.config import DatasetConfig
-from lm_saes.database import MongoClient, MongoDBConfig
-from lm_saes.models.clt import CrossLayerTranscoder
-from lm_saes.models.sparse_dictionary import SparseDictionary
+from lm_saes.activation.factory import ActivationFactory
+from lm_saes.clt import CrossLayerTranscoder
+from lm_saes.config import (
+    ActivationFactoryConfig,
+    CLTConfig,
+    DatasetConfig,
+    LanguageModelConfig,
+    MongoDBConfig,
+)
+from lm_saes.database import MongoClient
 from lm_saes.resource_loaders import load_dataset, load_model
-from lm_saes.utils.distributed import is_primary_rank
+from lm_saes.runners.utils import load_config
 from lm_saes.utils.logging import get_distributed_logger, setup_logging
 from lm_saes.utils.topk_to_jumprelu_conversion import topk_to_jumprelu_conversion
-
-from .utils import PretrainedSAE, load_config
 
 logger = get_distributed_logger("runners.topk_to_jumprelu_conversion")
 
 
-class ConvertTopKToJumpReLUSettings(BaseSettings):
-    """Settings for converting a TopK SAE model to JumpReLU. Currently only supports CrossLayerTranscoder models."""
+class ConvertCLTSettings(BaseSettings):
+    """Settings for converting a CLT model from topk to jumprelu."""
 
-    sae: PretrainedSAE
-    """Path to a pretrained TopK SAE model"""
+    sae: CLTConfig
+    """Configuration for the CLT model architecture and parameters"""
 
     sae_name: str
     """Name of the SAE model. Use as identifier for the SAE model in the database."""
@@ -48,7 +49,7 @@ class ConvertTopKToJumpReLUSettings(BaseSettings):
     """Configuration for the language model. Required if using dataset sources."""
 
     model_name: Optional[str] = None
-    """Name of the model/tokenizer to load."""
+    """Name of the tokenizer to load. CLT requires a tokenizer to get the modality indices."""
 
     datasets: Optional[dict[str, Optional[DatasetConfig]]] = None
     """Name to dataset config mapping. Required if using dataset sources."""
@@ -57,15 +58,15 @@ class ConvertTopKToJumpReLUSettings(BaseSettings):
     """Device type to use for distributed training ('cuda' or 'cpu')"""
 
     exp_result_path: str
-    """Path to save the converted JumpReLU SAE model"""
+    """Path to save the converted CLT model"""
 
 
 @torch.no_grad()
-def convert_topk_to_jumprelu(settings: ConvertTopKToJumpReLUSettings) -> None:
-    """Convert a TopK SAE model to JumpReLU.
+def convert_clt(settings: ConvertCLTSettings) -> None:
+    """Train a Cross Layer Transcoder (CLT) model.
 
     Args:
-        settings: Configuration settings for TopK to JumpReLU conversion
+        settings: Configuration settings for CLT conversion
     """
     # Set up logging
     setup_logging(level="INFO")
@@ -133,19 +134,14 @@ def convert_topk_to_jumprelu(settings: ConvertTopKToJumpReLUSettings) -> None:
         datasets=datasets,
     )
 
-    logger.info("Loading TopK SAE")
-    sae = SparseDictionary.from_pretrained(
-        settings.sae.pretrained_name_or_path,
+    logger.info("Loading CLT")
+    sae = CrossLayerTranscoder.from_config(
+        settings.sae,
         device_mesh=device_mesh,
         fold_activation_scale=False,
-        device=settings.sae.device,
-        dtype=settings.sae.dtype,
-        strict_loading=settings.sae.strict_loading,
     )
 
-    assert isinstance(sae, CrossLayerTranscoder), "Current implementation only supports CLTs"
-
-    logger.info(f"CLT loaded from {settings.sae}")
+    logger.info(f"CLT loaded from {settings.sae.sae_pretrained_name_or_path}")
     logger.info("Starting CLT conversion")
 
     sae = topk_to_jumprelu_conversion(
@@ -157,17 +153,10 @@ def convert_topk_to_jumprelu(settings: ConvertTopKToJumpReLUSettings) -> None:
     logger.info("Conversion completed, saving CLT model")
     sae.save_pretrained(
         save_path=settings.exp_result_path,
+        sae_name=settings.sae_name,
+        sae_series=settings.sae_series,
+        mongo_client=mongo_client,
     )
-    if is_primary_rank(device_mesh) and mongo_client is not None:
-        assert settings.sae_name is not None and settings.sae_series is not None, (
-            "sae_name and sae_series must be provided when saving to MongoDB"
-        )
-        mongo_client.create_sae(
-            name=settings.sae_name,
-            series=settings.sae_series,
-            path=str(Path(settings.exp_result_path).absolute()),
-            cfg=sae.cfg,
-        )
     sae.cfg.save_hyperparameters(settings.exp_result_path)
 
     logger.info("CLT conversion completed successfully")

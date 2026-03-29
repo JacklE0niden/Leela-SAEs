@@ -30,12 +30,10 @@ from einops import repeat
 from torch.distributed.device_mesh import DeviceMesh
 from tqdm import tqdm
 
+from lm_saes.abstract_sae import AbstractSparseAutoEncoder
 from lm_saes.activation.factory import ActivationFactory
-from lm_saes.models.lorsa import LowRankSparseAttention
-from lm_saes.models.sparse_dictionary import SparseDictionary
+from lm_saes.lorsa import LowRankSparseAttention
 from lm_saes.utils.discrete import KeyedDiscreteMapper
-from lm_saes.utils.distributed import is_primary_rank
-from lm_saes.utils.distributed.ops import item
 from lm_saes.utils.logging import get_distributed_logger
 
 from .base import PostAnalysisProcessor, register_post_analysis_processor
@@ -52,7 +50,7 @@ class LorsaPostAnalysisProcessor(PostAnalysisProcessor):
 
     def _process_tensors(
         self,
-        sae: SparseDictionary,
+        sae: AbstractSparseAutoEncoder,
         act_times: torch.Tensor,
         n_analyzed_tokens: int,
         max_feature_acts: torch.Tensor,
@@ -93,13 +91,13 @@ class LorsaPostAnalysisProcessor(PostAnalysisProcessor):
                 torch.arange(sampling_data["feature_acts"].shape[1], device=sae.cfg.device, dtype=torch.long)[None, :]
                 .expand(sampling_data["feature_acts"].shape[0], -1)
                 .flatten()
-            )  # [n_samples * d_sae]
+            )
             head_indices.append(head_index)
 
             _feature_acts.append(sampling_data["feature_acts"])
 
             # Get shard_idx and context_idx from metadata
-            # n_samples * d_sae
+            # n_samples x d_sae
             shard_indices = sampling_data.get(
                 "shard_idx", torch.zeros_like(sampling_data["feature_acts"][:, :, 0], dtype=torch.int64)
             ).flatten()
@@ -125,11 +123,7 @@ class LorsaPostAnalysisProcessor(PostAnalysisProcessor):
 
         visited = 0
         active_head_mask = act_times.ne(0)
-        pbar = tqdm(
-            total=interested_pairs.shape[0],
-            desc="Processing Lorsa z patterns",
-            disable=not is_primary_rank(device_mesh),
-        )
+        pbar = tqdm(total=interested_pairs.shape[0], desc="Processing Lorsa z patterns")
         # Iterate through activation stream
         for batch_data in activation_stream:
             # Extract metadata from batch
@@ -177,7 +171,7 @@ class LorsaPostAnalysisProcessor(PostAnalysisProcessor):
                     size=z_pattern_data.size(),
                 )
 
-                pbar.update(item(n_unfiltered_interested_pairs))
+                pbar.update(n_unfiltered_interested_pairs.item())
 
             if visited == interested_pairs.shape[0]:
                 break

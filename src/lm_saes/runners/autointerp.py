@@ -48,11 +48,12 @@ class AutoInterpSettings(BaseSettings):
     """Maximum number of workers to use for interpretation."""
 
 
-async def async_auto_interp(settings: AutoInterpSettings):
+async def interpret_feature(settings: AutoInterpSettings, show_progress: bool = True):
     """Interpret features using async API calls for maximum concurrency.
 
     Args:
         settings: Configuration for feature interpretation
+        show_progress: Whether to show progress bar (requires tqdm)
     """
 
     @lru_cache(maxsize=None)
@@ -83,13 +84,14 @@ async def async_auto_interp(settings: AutoInterpSettings):
         processed_count = processed
         if total_count is None:
             total_count = total
-            progress_bar = tqdm(
-                total=total,
-                desc="Interpreting features",
-                unit="feature",
-                dynamic_ncols=True,
-                initial=0,
-            )
+            if show_progress:
+                progress_bar = tqdm(
+                    total=total,
+                    desc="Interpreting features",
+                    unit="feature",
+                    dynamic_ncols=True,
+                    initial=0,
+                )
 
         if progress_bar is not None:
             progress_bar.n = processed
@@ -109,6 +111,9 @@ async def async_auto_interp(settings: AutoInterpSettings):
         if result["explanation"] is not None:
             interpretation = {
                 "text": result["explanation"],
+                "complexity": result.get("complexity"),
+                "consistency": result.get("consistency"),
+                "passed": result.get("passed"),
             }
         else:
             interpretation = None
@@ -121,9 +126,9 @@ async def async_auto_interp(settings: AutoInterpSettings):
 
 
 def auto_interp(settings: AutoInterpSettings):
-    """Synchronous wrapper for async_auto_interp.
+    """Synchronous wrapper for interpret_feature.
 
     Args:
         settings: Configuration for feature interpretation
     """
-    asyncio.run(async_auto_interp(settings))
+    asyncio.run(interpret_feature(settings))

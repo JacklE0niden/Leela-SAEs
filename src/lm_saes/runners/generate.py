@@ -4,26 +4,26 @@ import os
 from pathlib import Path
 from typing import Literal, Optional
 
-import torch
 from pydantic_settings import BaseSettings
 from torch.distributed.device_mesh import init_device_mesh
 
-from lm_saes.activation.factory import (
-    ActivationFactory,
+from lm_saes.activation.factory import ActivationFactory
+from lm_saes.activation.processors.cached_activation import CachedActivationLoader
+from lm_saes.activation.writer import ActivationWriter
+from lm_saes.config import (
     ActivationFactoryConfig,
     ActivationFactoryDatasetSource,
     ActivationFactoryTarget,
+    ActivationWriterConfig,
     BufferShuffleConfig,
+    DatasetConfig,
+    LanguageModelConfig,
+    MongoDBConfig,
 )
-from lm_saes.activation.processors.cached_activation import CachedActivationLoader
-from lm_saes.activation.writer import ActivationWriter, ActivationWriterConfig
-from lm_saes.backend.language_model import LanguageModelConfig
-from lm_saes.config import DatasetConfig
-from lm_saes.database import MongoClient, MongoDBConfig
+from lm_saes.database import MongoClient
 from lm_saes.resource_loaders import load_dataset, load_model
+from lm_saes.runners.utils import load_config
 from lm_saes.utils.logging import get_distributed_logger, setup_logging
-
-from .utils import load_config
 
 logger = get_distributed_logger("runners.generate")
 
@@ -46,7 +46,7 @@ class GenerateActivationsSettings(BaseSettings):
     hook_points: list[str]
     """List of model hook points to capture activations from"""
 
-    output_dir: str
+    output_dir: Path
     """Directory to save activation files"""
 
     target: ActivationFactoryTarget = ActivationFactoryTarget.ACTIVATIONS_2D
@@ -55,7 +55,7 @@ class GenerateActivationsSettings(BaseSettings):
     model_batch_size: int = 1
     """Batch size for model forward"""
 
-    batch_size: int
+    batch_size: Optional[int] = None
     """Size of the batch for activation generation"""
 
     buffer_size: Optional[int] = None
@@ -93,9 +93,6 @@ class GenerateActivationsSettings(BaseSettings):
 
     device_type: str = "cuda"
     """Device type to use for distributed training ('cuda' or 'cpu')"""
-
-    override_dtype: torch.dtype | None = None
-    """Dtype to override the activations to. If `None`, will not override the dtype."""
 
     def model_post_init(self, __context: dict) -> None:
         """Validate configuration after initialization."""
@@ -165,7 +162,6 @@ def generate_activations(settings: GenerateActivationsSettings) -> None:
         buffer_size=settings.buffer_size,
         buffer_shuffle=settings.buffer_shuffle,
         ignore_token_ids=settings.ignore_token_ids,
-        override_dtype=settings.override_dtype,
     )
 
     # Configure activation writer

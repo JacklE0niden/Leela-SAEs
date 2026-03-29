@@ -6,20 +6,11 @@ from transformer_lens import HookedTransformer
 
 from lm_saes.backend import LanguageModel
 from lm_saes.backend.language_model import TransformerLensLanguageModel
-from lm_saes.config import BaseConfig
-from lm_saes.models.clt import CrossLayerTranscoder
-from lm_saes.models.crosscoder import Crosscoder
-from lm_saes.models.lorsa import LowRankSparseAttention
-from lm_saes.models.sae import SparseAutoEncoder
-from lm_saes.models.sparse_dictionary import SparseDictionary
-
-
-class DirectLogitAttributorConfig(BaseConfig):
-    top_k: int = 10
-    """ The number of top tokens to attribute to. """
-
-    clt_layer: int | None = None
-    """ Layer to analyze for CLT. Provided iff analyzing CLT. """
+from lm_saes.clt import CrossLayerTranscoder
+from lm_saes.config import DirectLogitAttributorConfig
+from lm_saes.crosscoder import CrossCoder
+from lm_saes.lorsa import LowRankSparseAttention
+from lm_saes.sae import SparseAutoEncoder
 
 
 def _compute_logits_from_residual(residual: torch.Tensor, model: HookedTransformer) -> torch.Tensor:
@@ -56,8 +47,8 @@ def compute_logits_and_d_sae(sae, model: HookedTransformer, layer_idx: int | Non
 
 
 @compute_logits_and_d_sae.register
-def _(sae: Crosscoder, model: HookedTransformer, layer_idx: int | None = None) -> tuple[torch.Tensor, int]:
-    """Compute logits and d_sae for Crosscoder."""
+def _(sae: CrossCoder, model: HookedTransformer, layer_idx: int | None = None) -> tuple[torch.Tensor, int]:
+    """Compute logits and d_sae for CrossCoder."""
     residual = sae.W_D[-1]
     d_sae = sae.cfg.d_sae
     logits = _compute_logits_from_residual(residual, model)
@@ -108,9 +99,7 @@ class DirectLogitAttributor:
         self.cfg = cfg
 
     @torch.no_grad()
-    def direct_logit_attribute(
-        self, sae: SparseDictionary, model: LanguageModel, layer_idx: int | None = None
-    ) -> list[dict]:
+    def direct_logit_attribute(self, sae, model: LanguageModel, layer_idx: int | None = None):
         """Compute direct logit attribution for the given SAE.
 
         Args:

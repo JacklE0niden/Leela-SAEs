@@ -9,19 +9,33 @@ import torch
 from pydantic_settings import BaseSettings
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
-from lm_saes.activation.factory import ActivationFactory, ActivationFactoryConfig
-from lm_saes.analysis.direct_logit_attributor import DirectLogitAttributor, DirectLogitAttributorConfig
-from lm_saes.analysis.feature_analyzer import FeatureAnalyzer, FeatureAnalyzerConfig
-from lm_saes.backend.language_model import LanguageModelConfig, TransformerLensLanguageModel
-from lm_saes.config import DatasetConfig
-from lm_saes.database import MongoClient, MongoDBConfig
-from lm_saes.models.crosscoder import Crosscoder
-from lm_saes.models.sparse_dictionary import SparseDictionary
+from lm_saes.activation.factory import ActivationFactory
+from lm_saes.analysis.direct_logit_attributor import DirectLogitAttributor
+from lm_saes.analysis.feature_analyzer import FeatureAnalyzer
+from lm_saes.backend.language_model import TransformerLensLanguageModel
+from lm_saes.clt import CrossLayerTranscoder
+from lm_saes.config import (
+    ActivationFactoryConfig,
+    BaseSAEConfig,
+    CLTConfig,
+    CrossCoderConfig,
+    DatasetConfig,
+    DirectLogitAttributorConfig,
+    FeatureAnalyzerConfig,
+    LanguageModelConfig,
+    LorsaConfig,
+    MongoDBConfig,
+    SAEConfig,
+)
+from lm_saes.crosscoder import CrossCoder
+from lm_saes.database import MongoClient
+from lm_saes.lorsa import LowRankSparseAttention
+from lm_saes.molt import MixtureOfLinearTransform
 from lm_saes.resource_loaders import load_dataset, load_model
+from lm_saes.runners.utils import load_config
+from lm_saes.sae import SparseAutoEncoder
 from lm_saes.utils.distributed.utils import broadcast_object
 from lm_saes.utils.logging import get_distributed_logger, setup_logging
-
-from .utils import PretrainedSAE, load_config
 
 logger = get_distributed_logger("runners.analyze")
 
@@ -94,7 +108,7 @@ def save_analysis_to_file(
 class AnalyzeSAESettings(BaseSettings):
     """Settings for analyzing a Sparse Autoencoder."""
 
-    sae: PretrainedSAE
+    sae: BaseSAEConfig
     """Configuration for the SAE model architecture and parameters"""
 
     sae_name: str
@@ -110,7 +124,7 @@ class AnalyzeSAESettings(BaseSettings):
     """Configuration for the language model. Required if using dataset sources."""
 
     model_name: Optional[str] = None
-    """Name of the model/tokenizer to load."""
+    """Name of the tokenizer to load. LORSA may require a tokenizer to get the modality indices."""
 
     datasets: Optional[dict[str, Optional[DatasetConfig]]] = None
     """Name to dataset config mapping. Required if using dataset sources."""
@@ -201,16 +215,16 @@ def analyze_sae(settings: AnalyzeSAESettings) -> None:
 
     activation_factory = ActivationFactory(settings.activation_factory, device_mesh=device_mesh)
 
-    sae = SparseDictionary.from_pretrained(
-        settings.sae.pretrained_name_or_path,
-        device_mesh=device_mesh,
-        device=settings.sae.device,
-        dtype=settings.sae.dtype,
-        fold_activation_scale=settings.sae.fold_activation_scale,
-        strict_loading=settings.sae.strict_loading,
-    )
+    logger.info(f"Loading {settings.sae.sae_type} model")
+    sae_cls = {
+        "sae": SparseAutoEncoder,
+        "clt": CrossLayerTranscoder,
+        "lorsa": LowRankSparseAttention,
+        "molt": MixtureOfLinearTransform,
+    }[settings.sae.sae_type]
+    sae = sae_cls.from_config(settings.sae, device_mesh=device_mesh)
 
-    logger.info(f"SAE model loaded: {type(sae).__name__}")
+    logger.info(f"{settings.sae.sae_type} model loaded: {type(sae).__name__}")
 
     analyzer = FeatureAnalyzer(settings.analyzer)
     logger.info("Feature analyzer initialized")
@@ -255,14 +269,14 @@ def analyze_sae(settings: AnalyzeSAESettings) -> None:
         )
         logger.info(f"Results saved to: {pickle_path}")
 
-    logger.info("SAE analysis completed successfully")
+    logger.info(f"{settings.sae.sae_type} analysis completed successfully")
 
 
-class AnalyzeCrosscoderSettings(BaseSettings):
-    """Settings for analyzing a Crosscoder model."""
+class AnalyzeCrossCoderSettings(BaseSettings):
+    """Settings for analyzing a CrossCoder model."""
 
-    sae: PretrainedSAE
-    """Configuration for the Crosscoder model architecture and parameters"""
+    sae: CrossCoderConfig
+    """Configuration for the CrossCoder model architecture and parameters"""
 
     sae_name: str
     """Name of the SAE model. Use as identifier for the SAE model in the database."""
@@ -293,18 +307,22 @@ class AnalyzeCrosscoderSettings(BaseSettings):
 
 
 @torch.no_grad()
-def analyze_crosscoder(settings: AnalyzeCrosscoderSettings) -> None:
-    """Analyze a Crosscoder model. The key difference to analyze_sae is that the activation factories are a list of ActivationFactoryConfig, one for each head; and the analyzing contains a device mesh transformation from head parallelism to model (feature) parallelism.
+def analyze_crosscoder(settings: AnalyzeCrossCoderSettings) -> None:
+    """Analyze a CrossCoder model. The key difference to analyze_sae is that the activation factories are a list of ActivationFactoryConfig, one for each head; and the analyzing contains a device mesh transformation from head parallelism to model (feature) parallelism.
 
     Args:
-        settings: Configuration settings for Crosscoder analysis
+        settings: Configuration settings for CrossCoder analysis
     """
     # Set up logging
     setup_logging(level="INFO")
 
+    assert (
+        len(settings.activation_factories) * len(settings.activation_factories[0].hook_points) == settings.sae.n_heads
+    ), "Total number of hook points must match the number of heads in the CrossCoder"
+
     parallel_size = len(settings.activation_factories)
 
-    logger.info(f"Analyzing Crosscoder with {parallel_size} parallel size")
+    logger.info(f"Analyzing CrossCoder with {settings.sae.n_heads} heads, {parallel_size} parallel size")
 
     crosscoder_device_mesh = init_device_mesh(
         device_type=settings.device_type,
@@ -318,7 +336,7 @@ def analyze_crosscoder(settings: AnalyzeCrosscoderSettings) -> None:
         mesh_dim_names=("model",),
     )
 
-    logger.info("Device meshes initialized for Crosscoder analysis")
+    logger.info("Device meshes initialized for CrossCoder analysis")
 
     mongo_client = None
     if settings.mongo is not None:
@@ -328,27 +346,16 @@ def analyze_crosscoder(settings: AnalyzeCrosscoderSettings) -> None:
         assert settings.output_dir is not None, "Output directory must be provided if MongoDB client is not provided"
         logger.info(f"Analysis results will be saved to: {settings.output_dir}")
 
-    logger.info("Setting up activation factory for Crosscoder head")
+    logger.info("Setting up activation factory for CrossCoder head")
     activation_factory = ActivationFactory(settings.activation_factories[crosscoder_device_mesh.get_local_rank("head")])
 
-    logger.info("Loading Crosscoder model")
-    sae = Crosscoder.from_pretrained(
-        settings.sae.pretrained_name_or_path,
-        device_mesh=crosscoder_device_mesh,
-        device=settings.sae.device,
-        dtype=settings.sae.dtype,
-        fold_activation_scale=settings.sae.fold_activation_scale,
-        strict_loading=settings.sae.strict_loading,
-    )
-
-    assert len(settings.activation_factories) * len(settings.activation_factories[0].hook_points) == sae.cfg.n_heads, (
-        "Total number of hook points must match the number of heads in the Crosscoder"
-    )
+    logger.info("Loading CrossCoder model")
+    sae = CrossCoder.from_config(settings.sae, device_mesh=crosscoder_device_mesh, fold_activation_scale=False)
 
     logger.info("Feature analyzer initialized")
     analyzer = FeatureAnalyzer(settings.analyzer)
 
-    logger.info("Processing activations for Crosscoder analysis")
+    logger.info("Processing activations for CrossCoder analysis")
 
     with torch.amp.autocast(device_type=settings.device_type, dtype=settings.amp_dtype):
         result = analyzer.analyze_chunk(
@@ -357,7 +364,7 @@ def analyze_crosscoder(settings: AnalyzeCrosscoderSettings) -> None:
             device_mesh=device_mesh,
         )
 
-    logger.info("Crosscoder analysis completed, saving results to MongoDB")
+    logger.info("CrossCoder analysis completed, saving results to MongoDB")
     start_idx = 0 if device_mesh is None else device_mesh.get_local_rank("model") * len(result)
     if mongo_client is not None:
         mongo_client.add_feature_analysis(
@@ -381,13 +388,13 @@ def analyze_crosscoder(settings: AnalyzeCrosscoderSettings) -> None:
         )
         logger.info(f"Results saved to: {pickle_path}")
 
-    logger.info("Crosscoder analysis completed successfully")
+    logger.info("CrossCoder analysis completed successfully")
 
 
 class DirectLogitAttributeSettings(BaseSettings):
-    """Settings for analyzing a Crosscoder model."""
+    """Settings for analyzing a CrossCoder model."""
 
-    sae: PretrainedSAE
+    sae: BaseSAEConfig
     """Configuration for the SAE model architecture and parameters"""
 
     sae_name: str
@@ -459,13 +466,16 @@ def direct_logit_attribute(settings: DirectLogitAttributeSettings) -> None:
         logger.info(f"Analysis results to be updated: {settings.analysis_file}")
 
     logger.info("Loading SAE model")
-    sae = SparseDictionary.from_pretrained(
-        settings.sae.pretrained_name_or_path,
-        device=settings.sae.device,
-        dtype=settings.sae.dtype,
-        fold_activation_scale=settings.sae.fold_activation_scale,
-        strict_loading=settings.sae.strict_loading,
-    )
+    if isinstance(settings.sae, CrossCoderConfig):
+        sae = CrossCoder.from_config(settings.sae)
+    elif isinstance(settings.sae, SAEConfig):
+        sae = SparseAutoEncoder.from_config(settings.sae)
+    elif isinstance(settings.sae, CLTConfig):
+        sae = CrossLayerTranscoder.from_config(settings.sae)
+    elif isinstance(settings.sae, LorsaConfig):
+        sae = LowRankSparseAttention.from_config(settings.sae)
+    else:
+        raise ValueError(f"Unsupported SAE config type: {type(settings.sae)}")
 
     # Load configurations
     model_cfg = load_config(

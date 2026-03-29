@@ -1,55 +1,49 @@
-from .activation import (
-    ActivationFactory,
+from .activation import ActivationFactory, ActivationWriter
+from .activation_functions import JumpReLU
+from .analysis import DirectLogitAttributor, FeatureAnalyzer
+from .circuit import ReplacementModel, attribute
+from .clt import CrossLayerTranscoder
+from .config import (
     ActivationFactoryActivationsSource,
     ActivationFactoryConfig,
     ActivationFactoryDatasetSource,
     ActivationFactoryTarget,
-    ActivationWriter,
     ActivationWriterConfig,
     BufferShuffleConfig,
-)
-from .activation_functions import JumpReLU
-from .analysis import (
-    DirectLogitAttributor,
+    CLTConfig,
+    CrossCoderConfig,
+    DatasetConfig,
     DirectLogitAttributorConfig,
-    FeatureAnalyzer,
     FeatureAnalyzerConfig,
+    InitializerConfig,
+    LanguageModelConfig,
+    LLaDAConfig,
+    LorsaConfig,
+    MOLTConfig,
+    MongoDBConfig,
+    SAEConfig,
+    TrainerConfig,
+    WandbConfig,
 )
-from .backend.language_model import HuggingFaceLanguageModel, LanguageModelConfig, TransformerLensLanguageModel
-from .circuit import ReplacementModel, attribute
-from .config import DatasetConfig
-from .database import MongoClient, MongoDBConfig
+from .crosscoder import CrossCoder
+from .database import MongoClient
 from .evaluator import EvalConfig, Evaluator
-from .initializer import Initializer, InitializerConfig
-from .models.clt import CLTConfig, CrossLayerTranscoder
-from .models.crosscoder import Crosscoder, CrosscoderConfig
-from .models.lorsa import LorsaConfig, LowRankSparseAttention
-from .models.molt import MixtureOfLinearTransform, MOLTConfig
-from .models.protocols import (
-    DatasetNormStandardizable,
-    EncoderInitializable,
-    NormComputing,
-    NormConstrainable,
-)
-from .models.sae import SAEConfig, SparseAutoEncoder
-from .models.sparse_dictionary import SparseDictionary, SparseDictionaryConfig
-from .models.sparse_dictionary import SparseDictionaryConfig as BaseSAEConfig  # backward compat
+from .lorsa import LowRankSparseAttention
+from .molt import MixtureOfLinearTransform
 from .resource_loaders import load_dataset, load_model
 from .runners import (
-    AnalyzeCrosscoderSettings,
+    AnalyzeCrossCoderSettings,
     AnalyzeSAESettings,
     AutoInterpSettings,
     CheckActivationConsistencySettings,
-    ConvertTopKToJumpReLUSettings,
     DirectLogitAttributeSettings,
-    EvaluateCrosscoderSettings,
+    EvaluateCrossCoderSettings,
     EvaluateSAESettings,
     GenerateActivationsSettings,
-    PretrainedSAE,
     SweepingItem,
     SweepSAESettings,
     TrainCLTSettings,
-    TrainCrosscoderSettings,
+    TrainCrossCoderSettings,
     TrainLorsaSettings,
     TrainMOLTSettings,
     TrainSAESettings,
@@ -57,7 +51,6 @@ from .runners import (
     analyze_sae,
     auto_interp,
     check_activation_consistency,
-    convert_topk_to_jumprelu,
     direct_logit_attribute,
     evaluate_crosscoder,
     evaluate_sae,
@@ -69,27 +62,18 @@ from .runners import (
     train_molt,
     train_sae,
 )
-from .trainer import Trainer, TrainerConfig, WandbConfig
-from .utils.logging import setup_logging
+from .sae import SparseAutoEncoder
 
 __all__ = [
     "ActivationFactory",
     "ActivationWriter",
-    "SparseDictionary",
-    "SparseDictionaryConfig",
-    "BaseSAEConfig",  # backward compat alias
-    "NormComputing",
-    "NormConstrainable",
-    "DatasetNormStandardizable",
-    "EncoderInitializable",
     "CLTConfig",
     "CrossLayerTranscoder",
-    "CrosscoderConfig",
-    "Crosscoder",
+    "CrossCoderConfig",
+    "CrossCoder",
     "SparseAutoEncoder",
     "JumpReLU",
     "LanguageModelConfig",
-    "HuggingFaceLanguageModel",
     "DatasetConfig",
     "ActivationFactoryActivationsSource",
     "ActivationFactoryDatasetSource",
@@ -100,7 +84,7 @@ __all__ = [
     "load_dataset",
     "load_model",
     "FeatureAnalyzer",
-    "EvaluateCrosscoderSettings",
+    "EvaluateCrossCoderSettings",
     "evaluate_crosscoder",
     "EvaluateSAESettings",
     "Evaluator",
@@ -110,18 +94,12 @@ __all__ = [
     "generate_activations",
     "CheckActivationConsistencySettings",
     "check_activation_consistency",
-    "Initializer",
     "InitializerConfig",
     "SAEConfig",
-    "Trainer",
     "TrainerConfig",
-    "TransformerLensLanguageModel",
     "WandbConfig",
-    "setup_logging",
     "train_sae",
     "TrainSAESettings",
-    "ConvertTopKToJumpReLUSettings",
-    "convert_topk_to_jumprelu",
     "TrainCLTSettings",
     "train_clt",
     "AnalyzeSAESettings",
@@ -129,14 +107,15 @@ __all__ = [
     "FeatureAnalyzerConfig",
     "MongoDBConfig",
     "MongoClient",
-    "AnalyzeCrosscoderSettings",
+    "AnalyzeCrossCoderSettings",
     "analyze_crosscoder",
     "AutoInterpSettings",
     "SweepingItem",
     "SweepSAESettings",
-    "TrainCrosscoderSettings",
+    "TrainCrossCoderSettings",
     "auto_interp",
     "sweep_sae",
+    "LLaDAConfig",
     "train_crosscoder",
     "ReplacementModel",
     "attribute",
@@ -152,5 +131,4 @@ __all__ = [
     "train_molt",
     "TrainMOLTSettings",
     "DirectLogitAttributorConfig",
-    "PretrainedSAE",
 ]

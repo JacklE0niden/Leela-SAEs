@@ -1,16 +1,30 @@
 from typing import Any, Literal, Optional, cast
 
 import datasets
+import torch
 from torch.distributed.device_mesh import DeviceMesh
 
 from lm_saes.backend.language_model import (
-    HuggingFaceLanguageModel,
     LanguageModel,
-    LanguageModelConfig,
-    QwenVLLanguageModel,
+    LLaDALanguageModel,
+    # SearchlessChessModel,
+    # SearchlessChessBehavioralCloningModel,
+    # QwenLanguageModel,
+    # QwenVLLanguageModel,
     TransformerLensLanguageModel,
+    LeelaChessModel,
 )
-from lm_saes.config import DatasetConfig
+from lm_saes.config import DatasetConfig, LanguageModelConfig, LLaDAConfig
+
+
+def dataset_transform(data):
+    if "image" in data:
+        # Rename image to images
+        data["images"] = data["image"]
+        del data["image"]
+
+        data["images"] = [[torch.tensor(image) for image in images] for images in data["images"]]
+    return data
 
 
 def load_dataset_shard(
@@ -24,6 +38,7 @@ def load_dataset_shard(
         dataset = datasets.load_from_disk(cfg.dataset_name_or_path)
     dataset = cast(datasets.Dataset, dataset)
     dataset = dataset.shard(num_shards=n_shards, index=shard_idx, contiguous=True)
+    dataset.set_transform(dataset_transform)
     return dataset
 
 
@@ -53,6 +68,7 @@ def load_dataset(
     else:
         shard = dataset
         shard_metadata = None
+    shard.set_transform(dataset_transform)
     return shard, shard_metadata
 
 
@@ -60,6 +76,8 @@ def infer_model_backend(model_name: str) -> Literal["huggingface", "transformer_
     if model_name.startswith("Qwen/Qwen2.5-VL"):
         return "huggingface"
     elif model_name.startswith("Qwen/Qwen2.5"):
+        return "huggingface"
+    elif model_name.startswith("GSAI-ML/LLaDA"):
         return "huggingface"
     else:
         return "transformer_lens"
@@ -70,9 +88,22 @@ def load_model(cfg: LanguageModelConfig) -> LanguageModel:
     if backend == "huggingface":
         if cfg.model_name.startswith("Qwen/Qwen2.5-VL"):
             return QwenVLLanguageModel(cfg)
+        elif cfg.model_name.startswith("Qwen/Qwen2.5"):
+            return QwenLanguageModel(cfg)
         else:
-            return HuggingFaceLanguageModel(cfg)
+            raise NotImplementedError(f"Model {cfg.model_name} not supported in HuggingFace backend.")
     elif backend == "transformer_lens":
-        return TransformerLensLanguageModel(cfg)
+        if cfg.model_name.startswith("GSAI-ML/LLaDA"):
+            assert isinstance(cfg, LLaDAConfig), "cfg is not a LLaDAConfig"
+            return LLaDALanguageModel(cfg)
+        elif cfg.model_name.startswith("google/searchless-chess"):
+            print("loading a searchless_chess model, welcome to play chess with me.  ^^")
+            # assert isinstance(cfg, SearchlessChessConfig), "cfg is not a SearchlessChessConfig"
+            return SearchlessChessBehavioralCloningModel(cfg)
+        elif cfg.model_name.startswith("lc0"):
+            print("loading a leela chess model, welcome to play chess with me.  ^^")
+            return LeelaChessModel(cfg)
+        else:
+            return TransformerLensLanguageModel(cfg)
     else:
         raise NotImplementedError(f"Backend {backend} not supported.")

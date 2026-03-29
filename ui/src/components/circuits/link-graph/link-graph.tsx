@@ -1,448 +1,352 @@
-import React, { useCallback, useEffect, useMemo, useRef } from 'react'
-import * as d3 from 'd3'
+import React, { useEffect, useRef, useState, useCallback, useMemo } from "react";
+import { LinkGraphData, VisState } from "./types";
+// @ts-ignore
+import d3 from "../static_js/d3";
+import "./link-graph.css";
 import {
   GridLines,
+  RowBackgrounds,
+  YAxis,
   Links,
   Nodes,
-  RowBackgrounds,
-  TokenLabels,
   Tooltips,
-  YAxis,
-} from './index'
-import type {
-  CircuitData,
-  Node,
-  PositionedNode,
-  VisState,
-} from '@/types/circuit'
-import {
-  createEdgeIndex,
-  createNodeIndex,
-  createPositionedEdges,
-  createSpatialIndex,
-  findNearestNode,
-  getNodesByCtxIdx,
-} from '@/utils/circuit-index'
-import { useLocalStorage } from '@/hooks/useLocalStorage'
+  TokenLabels
+} from "./atomic-components";
+
+// Performance optimization: Replaced expensive closest node logic with exact hover detection.
+// Hover tooltips and indicators are preserved but only trigger when mouse is directly over nodes.
+// This provides the same UX with much better performance on large graphs.
 
 interface LinkGraphProps {
-  data: CircuitData
-  visState: VisState
-  onNodeClick: (nodeId: string, isMultiSelect: boolean) => void
-  onNodeHover: (nodeId: string | null) => void
-}
-
-const BOTTOM_PADDING = 50
-const SIDE_PADDING = 70
-const MIN_UNIT_WIDTH = 8
-
-function topologicalSort(
-  nodes: Node[],
-  outgoingEdges: Map<string, Set<string>>,
-): Node[] {
-  const nodeIds = new Set(nodes.map((n) => n.nodeId))
-  const inDegree = new Map<string, number>()
-  const localOutgoing = new Map<string, string[]>()
-
-  for (const node of nodes) {
-    inDegree.set(node.nodeId, 0)
-    localOutgoing.set(node.nodeId, [])
-  }
-
-  for (const node of nodes) {
-    const targets = outgoingEdges.get(node.nodeId)
-    if (targets) {
-      for (const target of targets) {
-        if (nodeIds.has(target)) {
-          localOutgoing.get(node.nodeId)!.push(target)
-          inDegree.set(target, (inDegree.get(target) || 0) + 1)
-        }
-      }
-    }
-  }
-
-  // Kahn's algorithm
-  const queue: Node[] = []
-  const nodeMap = new Map(nodes.map((n) => [n.nodeId, n]))
-
-  for (const node of nodes) {
-    if (inDegree.get(node.nodeId) === 0) {
-      queue.push(node)
-    }
-  }
-
-  const sorted: Node[] = []
-  while (queue.length > 0) {
-    const node = queue.shift()!
-    sorted.push(node)
-
-    for (const targetId of localOutgoing.get(node.nodeId) || []) {
-      const newDegree = (inDegree.get(targetId) || 1) - 1
-      inDegree.set(targetId, newDegree)
-      if (newDegree === 0) {
-        queue.push(nodeMap.get(targetId)!)
-      }
-    }
-  }
-
-  // Handle cycles by adding remaining nodes
-  if (sorted.length < nodes.length) {
-    for (const node of nodes) {
-      if (!sorted.includes(node)) {
-        sorted.push(node)
-      }
-    }
-  }
-
-  return sorted
+  data: LinkGraphData;
+  visState: VisState;
+  onNodeClick: (nodeId: string, metaKey: boolean) => void;
+  onNodeHover: (nodeId: string | null) => void;
+  hideEmbLogit?: boolean; // Whether to hide Emb and Logit layers (for interaction circuit mode)
 }
 
 const LinkGraphComponent: React.FC<LinkGraphProps> = ({
-  data: rawData,
+  data,
   visState,
   onNodeClick,
   onNodeHover,
+  hideEmbLogit = false,
 }) => {
-  const containerRef = useRef<HTMLDivElement>(null)
-  const [containerDimensions, setContainerDimensions] = useLocalStorage(
-    'linkGraphDimensions',
-    {
-      width: 800,
-      height: 600,
-    },
-  )
-
-  const data = useMemo(() => {
-    const nodes = rawData.nodes.filter((n) => !n.isFromQkTracing)
-    const nodeIds = new Set(nodes.map((n) => n.nodeId))
-    const edges = rawData.edges.filter(
-      (e) => nodeIds.has(e.source) && nodeIds.has(e.target),
-    )
-    return { ...rawData, nodes, edges }
-  }, [rawData])
-
-  // 1. Calculate stats about context counts and total units needed
-  const { calculatedCtxCounts, totalUnits } = useMemo(() => {
+  // onNodeHover is kept for interface compatibility but not used for performance
+  const svgRef = useRef<SVGSVGElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [dimensions, setDimensions] = useState({ width: 800, height: 600 });
+  const BOTTOM_PADDING = 50; // Space for token labels
+  const SIDE_PADDING = 20; // Space for left and right margins
+  
+  // Memoize expensive calculations
+  const { calculatedCtxCounts, x, y, positionedNodes, positionedLinks } = useMemo(() => {
     if (!data.nodes.length) {
-      return { calculatedCtxCounts: [], totalUnits: 0 }
+      return { calculatedCtxCounts: [], x: null, y: null, positionedNodes: [], positionedLinks: [] };
     }
 
-    const { nodes } = data
-    const earliestCtxWithNodes = d3.min(nodes, (d) => d.ctxIdx) || 0
-
-    let cumsum = 0
-    const calculatedCtxCounts = d3
-      .range((d3.max(nodes, (d) => d.ctxIdx) || 0) + 1)
-      .map((ctxIdx: number) => {
-        if (ctxIdx >= earliestCtxWithNodes) {
-          const group = nodes.filter((d) => d.ctxIdx === ctxIdx)
-          const layerGroups = d3.group(group, (d) => d.layer)
-          const maxNodesPerLayer =
-            d3.max(
-              Array.from(layerGroups.values()),
-              (layerNodes) => layerNodes.length,
-            ) || 1
-          const maxCount = Math.max(1, maxNodesPerLayer)
-          cumsum += maxCount
-          return { ctxIdx, maxCount, cumsum, layerGroups }
-        }
-        return { ctxIdx, maxCount: 0, cumsum, layerGroups: new Map() }
-      })
-
-    const totalUnits = cumsum + 2 * calculatedCtxCounts.length
-
-    return { calculatedCtxCounts, totalUnits }
-  }, [data.nodes])
-
-  // 2. Calculate graph dimensions based on data density and container size
-  const dimensions = useMemo(() => {
-    const minWidth = totalUnits * MIN_UNIT_WIDTH + SIDE_PADDING
-    return {
-      width: Math.max(containerDimensions.width, minWidth),
-      height: containerDimensions.height,
-    }
-  }, [totalUnits, containerDimensions])
-
-  // 3. Calculate scales and node positions
-  const { x, y, positionedNodes } = useMemo(() => {
-    if (!calculatedCtxCounts.length) {
-      return {
-        x: null,
-        y: null,
-        positionedNodes: [],
+    const { nodes } = data;
+    const earliestCtxWithNodes = d3.min(nodes, (d: any) => d.ctx_idx) || 0;
+    
+    let cumsum = 0;
+    const calculatedCtxCounts = d3.range(d3.max(nodes, (d: any) => d.ctx_idx) + 1).map((ctx_idx: number) => {
+      if (ctx_idx >= earliestCtxWithNodes) {
+        const group = nodes.filter((d: any) => d.ctx_idx === ctx_idx);
+        const layerGroups = d3.group(group, (d: any) => d.layerIdx);
+        const maxNodesPerLayer = d3.max(Array.from(layerGroups.values()), (layerNodes: any) => layerNodes.length) || 1;
+        const maxCount = Math.max(1, maxNodesPerLayer);
+        cumsum += maxCount;
+        return { ctx_idx, maxCount, cumsum, layerGroups };
       }
-    }
+      return { ctx_idx, maxCount: 0, cumsum, layerGroups: new Map() };
+    });
 
-    const { nodes, edges } = data
+    const xDomain = [-1].concat(calculatedCtxCounts.map((d: any) => d.ctx_idx));
+    const xRange = [SIDE_PADDING].concat(calculatedCtxCounts.map((d: any) => SIDE_PADDING + d.cumsum * (dimensions.width - 2 * SIDE_PADDING) / cumsum));
+    const x = d3.scaleLinear().domain(xDomain.map((d: any) => d + 1)).range(xRange);
 
-    // Build outgoing edges map for topological sorting
-    const outgoingEdges = new Map<string, Set<string>>()
-    for (const edge of edges) {
-      if (!outgoingEdges.has(edge.source)) {
-        outgoingEdges.set(edge.source, new Set())
-      }
-      outgoingEdges.get(edge.source)!.add(edge.target)
-    }
+    const yNumTicks = d3.max(nodes, (d: any) => d.layerIdx) + 1;
+    const y = d3.scaleBand(d3.range(yNumTicks), [dimensions.height - BOTTOM_PADDING, 0]);
 
-    const xDomain = [-1].concat(calculatedCtxCounts.map((d: any) => d.ctxIdx))
-    const xRange = [SIDE_PADDING].concat(
-      calculatedCtxCounts.map(
-        (d: any, i: number) =>
-          SIDE_PADDING +
-          ((d.cumsum + 2 * (i + 1)) * (dimensions.width - SIDE_PADDING)) /
-            totalUnits,
-      ),
-    )
-    const x = d3
-      .scaleLinear()
-      .domain(xDomain.map((d) => d + 1))
-      .range(xRange)
-
-    const yNumTicks = (d3.max(nodes, (d) => d.layer) || 0) + 2
-    const y = d3.scaleBand<number>(d3.range(yNumTicks), [
-      dimensions.height - BOTTOM_PADDING,
-      0,
-    ])
-
+    // Position nodes
     calculatedCtxCounts.forEach((d: any) => {
-      d.width = x(d.ctxIdx + 1) - x(d.ctxIdx)
-    })
+      d.width = x(d.ctx_idx + 1) - x(d.ctx_idx);
+    });
 
-    const padR =
-      Math.min(
-        8,
-        d3.min(calculatedCtxCounts.slice(1), (d: any) => d.width / 2) || 8,
-      ) + 0
+    const padR = Math.min(8, d3.min(calculatedCtxCounts.slice(1), (d: any) => d.width / 2)) + 0;
 
-    const positionedNodes: PositionedNode[] = nodes.map((node) => ({
-      ...node,
-      pos: [0, 0] as [number, number],
-    }))
+    // Create a copy of nodes to avoid mutating the original data
+    const positionedNodes = nodes.map((node: any) => ({ ...node }));
 
-    const xOffsets = new Map<string, number>()
-
+    // Position nodes within each context and layer
     calculatedCtxCounts.forEach((ctxData: any) => {
-      if (ctxData.layerGroups.size === 0) return
+      if (ctxData.layerGroups.size === 0) return;
+      
+      const ctxWidth = x(ctxData.ctx_idx + 1) - x(ctxData.ctx_idx) - padR;
+      
+      ctxData.layerGroups.forEach((layerNodes: any, layerIdx: number) => {
+        // Custom sorting: shared -> single files by upload order -> error
+        const getIsError = (n: any) => typeof n.feature_type === 'string' && n.feature_type.toLowerCase().includes('error');
+        const getIsShared = (n: any) => Array.isArray(n.sourceIndices) && n.sourceIndices.length > 1;
+        const getFileIndex = (n: any) => (n.sourceIndex !== undefined ? n.sourceIndex : (Array.isArray(n.sourceIndices) && n.sourceIndices.length ? n.sourceIndices[0] : 0));
+        const groupIndex = (n: any) => {
+          if (getIsError(n)) return 1000; // error nodes go last
+          if (getIsShared(n)) return 0;   // shared nodes first
+          return 1 + getFileIndex(n);     // single files by upload order
+        };
+        layerNodes.sort((a: any, b: any) => {
+          const ga = groupIndex(a);
+          const gb = groupIndex(b);
+          if (ga !== gb) return ga - gb;
+          // Keep stable within same group: use logitPct as secondary key (descending)
+          const la = a.logitPct || 0;
+          const lb = b.logitPct || 0;
+          return (lb - la);
+        });
+        
+        const maxNodesInContext = ctxData.maxCount;
+        const spacing = ctxWidth / maxNodesInContext;
+        
+        layerNodes.forEach((node: any, i: number) => {
+          const totalWidth = (layerNodes.length - 1) * spacing;
+          const startX = ctxWidth - totalWidth;
+          node.xOffset = startX + i * spacing;
+          node.yOffset = 0;
+        });
+      });
+    });
 
-      const ctxWidth = x(ctxData.ctxIdx + 1) - x(ctxData.ctxIdx) - padR
+    positionedNodes.forEach((d: any) => {
+      d.pos = [
+        x(d.ctx_idx) + d.xOffset,
+        y(d.layerIdx) + y.bandwidth() / 2 + d.yOffset,
+      ];
+    });
 
-      ctxData.layerGroups.forEach(
-        (layerNodes: typeof nodes, _layerIdx: number) => {
-          // Topological sort first
-          let sortedNodes = topologicalSort(layerNodes, outgoingEdges)
-
-          // Then sort for logits by token probability
-          sortedNodes = sortedNodes.sort((a, b) => {
-            if (a.featureType === 'logit' && b.featureType === 'logit') {
-              return -(a.tokenProb || 0) + (b.tokenProb || 0)
-            }
-            return 0
-          })
-
-          const maxNodesInContext = ctxData.maxCount
-          const spacing = ctxWidth / maxNodesInContext
-
-          sortedNodes.forEach((node, i) => {
-            const totalWidth = (sortedNodes.length - 1) * spacing
-            const startX = ctxWidth - totalWidth
-            xOffsets.set(node.nodeId, startX + i * spacing)
-          })
-        },
-      )
-    })
-
-    positionedNodes.forEach((d) => {
-      const xOffset = xOffsets.get(d.nodeId) || 0
-      d.pos = [x(d.ctxIdx) + xOffset, (y(d.layer + 1) || 0) + y.bandwidth() / 2]
-    })
-
-    return { x, y, positionedNodes }
-  }, [data.nodes, data.edges, dimensions, calculatedCtxCounts, totalUnits])
-
-  const nodeIndex = useMemo(
-    () => createNodeIndex(positionedNodes),
-    [positionedNodes],
-  )
-
-  const positionedEdges = useMemo(
-    () => createPositionedEdges(data.edges, nodeIndex),
-    [data.edges, nodeIndex],
-  )
-
-  const edgeIndex = useMemo(
-    () => createEdgeIndex(positionedEdges),
-    [positionedEdges],
-  )
-
-  const spatialIndex = useMemo(
-    () => createSpatialIndex(positionedNodes),
-    [positionedNodes],
-  )
-
-  const handleMouseMove = useCallback(
-    (event: React.MouseEvent<SVGSVGElement>) => {
-      const MAGNET_THRESHOLD = 30
-      const rect = event.currentTarget.getBoundingClientRect()
-      const mouseX = event.clientX - rect.left
-      const mouseY = event.clientY - rect.top
-
-      const nearestNode = findNearestNode(
-        spatialIndex,
-        mouseX,
-        mouseY,
-        MAGNET_THRESHOLD,
-      )
-      onNodeHover(nearestNode?.nodeId ?? null)
-    },
-    [spatialIndex, onNodeHover],
-  )
-
-  const handleClick = useCallback(
-    (event: React.MouseEvent<SVGSVGElement>) => {
-      const MAGNET_THRESHOLD = 30
-      const rect = event.currentTarget.getBoundingClientRect()
-      const mouseX = event.clientX - rect.left
-      const mouseY = event.clientY - rect.top
-
-      const nearestNode = findNearestNode(
-        spatialIndex,
-        mouseX,
-        mouseY,
-        MAGNET_THRESHOLD,
-      )
-
-      if (nearestNode) {
-        onNodeClick(nearestNode.nodeId, event.metaKey || event.ctrlKey)
+    // Update link paths and populate node link references
+    const positionedLinks = data.links.map((d: any) => {
+      const sourceNode = positionedNodes.find((n: any) => n.nodeId === d.source);
+      const targetNode = positionedNodes.find((n: any) => n.nodeId === d.target);
+      if (sourceNode && targetNode) {
+        const [x1, y1] = sourceNode.pos;
+        const [x2, y2] = targetNode.pos;
+        return {
+          ...d,
+          pathStr: `M${x1},${y1}L${x2},${y2}`
+        };
       }
-    },
-    [spatialIndex, onNodeClick],
-  )
+      // Skip invalid links
+      return null;
+    }).filter(Boolean);
 
+    return { calculatedCtxCounts, x, y, positionedNodes, positionedLinks };
+  }, [data.nodes, data.links, dimensions.width, dimensions.height]);
+
+  // Handle mouse enter/leave for exact hover detection (much more performant than closest node)
+  const handleNodeMouseEnter = useCallback((nodeId: string) => {
+    onNodeHover(nodeId);
+  }, [onNodeHover]);
+
+  const handleNodeMouseLeave = useCallback(() => {
+    onNodeHover(null);
+  }, [onNodeHover]);
+
+  // Handle resize
   useEffect(() => {
     const updateDimensions = () => {
       if (containerRef.current) {
-        const rect = containerRef.current.getBoundingClientRect()
-        const newWidth = rect.width
-        const newHeight = rect.height - 20
-
-        setContainerDimensions((prev) => {
-          if (
-            Math.abs(prev.width - newWidth) < 1 &&
-            Math.abs(prev.height - newHeight) < 1
-          ) {
-            return prev
-          }
-          return {
-            width: newWidth,
-            height: newHeight,
-          }
-        })
+        const rect = containerRef.current.getBoundingClientRect();
+        setDimensions({
+          width: rect.width,
+          height: rect.height
+        });
       }
-    }
+    };
 
-    updateDimensions()
+    // Initial size
+    updateDimensions();
 
-    const resizeObserver = new ResizeObserver(updateDimensions)
+    // Set up resize observer
+    const resizeObserver = new ResizeObserver(updateDimensions);
     if (containerRef.current) {
-      resizeObserver.observe(containerRef.current)
+      resizeObserver.observe(containerRef.current);
     }
 
+    // Cleanup
     return () => {
-      resizeObserver.disconnect()
-    }
-  }, [setContainerDimensions])
+      resizeObserver.disconnect();
+    };
+  }, []);
 
+  // Memoize token data calculation - only show positions that have features
   const tokenData = useMemo(() => {
-    if (!data.metadata?.promptTokens || !positionedNodes.length || !x) return []
-
-    const maxCtxIdx = d3.max(positionedNodes, (d) => d.ctxIdx) || 0
-
-    return data.metadata.promptTokens
-      .slice(0, maxCtxIdx + 1)
-      .map((token: string, index: number) => {
-        const contextNodes = getNodesByCtxIdx(nodeIndex, index)
-
-        if (contextNodes.length === 0) {
-          return {
-            token,
-            ctxIdx: index,
-            x: x(index + 1) - (x(index + 1) - x(index)) / 2,
-          }
-        }
-
-        let rightX = -Infinity
-        for (const node of contextNodes) {
-          if (node.pos[0] > rightX) rightX = node.pos[0]
-        }
-
+    if (!positionedNodes.length) return [];
+    
+    // Get unique ctx_idx values that have nodes
+    const ctxIndicesWithNodes = Array.from(new Set(positionedNodes.map((d: any) => d.ctx_idx))).sort((a, b) => a - b);
+    
+    return ctxIndicesWithNodes
+      .map((ctx_idx: number) => {
+        const contextNodes = positionedNodes.filter((d: any) => d.ctx_idx === ctx_idx);
+        
+        if (contextNodes.length === 0) return null;
+        
+        const nodeXPositions = contextNodes.map((d: any) => d.pos[0]);
+        const rightX = Math.max(...nodeXPositions);
+        
+        // Get token if available, otherwise use empty string (position index is shown separately)
+        const token = data.metadata?.prompt_tokens && ctx_idx < data.metadata.prompt_tokens.length
+          ? data.metadata.prompt_tokens[ctx_idx]
+          : '';
+        
         return {
           token,
-          ctxIdx: index,
-          x: rightX,
-        }
+          ctx_idx,
+          x: rightX
+        };
       })
-  }, [data.metadata?.promptTokens, positionedNodes, nodeIndex, x])
+      .filter(Boolean); // Remove null entries
+  }, [data.metadata?.prompt_tokens, positionedNodes, x]);
 
+  // Early return if no data or scales
   if (!positionedNodes.length || !x || !y) {
     return (
-      <div ref={containerRef} className="relative w-full h-[400px]">
-        <div className="flex items-center justify-center h-full text-slate-500">
-          Loading circuit graph...
-        </div>
+      <div ref={containerRef} className="link-graph-container">
+        <div className="flex items-center justify-center h-full text-slate-500">Loading circuit graph...</div>
       </div>
-    )
+    );
   }
 
   return (
     <div
       ref={containerRef}
-      className="relative w-full min-h-[420px] h-[420px] overflow-x-auto overflow-y-hidden"
+      className="link-graph-container"
     >
       <svg
+        ref={svgRef}
         width={dimensions.width}
         height={dimensions.height}
-        className="relative z-1"
-        style={{ pointerEvents: 'auto' }}
-        onMouseMove={handleMouseMove}
-        onClick={handleClick}
+        onClick={(event) => {
+          // Only clear selection if clicking on the SVG background (not on nodes)
+          if (event.target === event.currentTarget) {
+            console.log("[LinkGraph] SVG 背景点击，清除选中");
+            onNodeClick("", false);
+          }
+        }}
+        onMouseLeave={() => {
+          // Clear hover when mouse leaves the graph area (safety net when DOM is recreated)
+          handleNodeMouseLeave();
+        }}
+        style={{ position: "relative", zIndex: 1, pointerEvents: "auto" }}
       >
-        <RowBackgrounds
+        {/* Atomic components - each manages its own rendering */}
+        <RowBackgrounds 
           dimensions={dimensions}
           positionedNodes={positionedNodes}
           y={y}
         />
-
-        <GridLines
+        
+        <GridLines 
           dimensions={dimensions}
           calculatedCtxCounts={calculatedCtxCounts}
           x={x}
           positionedNodes={positionedNodes}
         />
-
-        <YAxis positionedNodes={positionedNodes} y={y} />
-
-        <Links edgeIndex={edgeIndex} visState={visState} />
-
-        <Nodes
+        
+        <YAxis 
           positionedNodes={positionedNodes}
-          edgeIndex={edgeIndex}
-          visState={{
-            clickedId: visState.clickedId,
-            hoveredId: visState.hoveredId,
-            selectedIds: visState.selectedIds,
-          }}
+          y={y}
+          hideEmbLogit={hideEmbLogit}
         />
-
-        <Tooltips
+        
+        <Links 
+          positionedLinks={positionedLinks}
+        />
+        
+        <Nodes 
           positionedNodes={positionedNodes}
-          visState={{ hoveredId: visState.hoveredId }}
+          positionedLinks={positionedLinks}
+          clickedId={visState.clickedId}
+          hoveredId={visState.hoveredId}
+          onNodeMouseEnter={handleNodeMouseEnter}
+          onNodeMouseLeave={handleNodeMouseLeave}
+          onNodeClick={onNodeClick}
+        />
+        
+        <Tooltips 
+          positionedNodes={positionedNodes}
+          hoveredId={visState.hoveredId}
           dimensions={dimensions}
         />
-
-        <TokenLabels tokenData={tokenData} dimensions={dimensions} />
+        
+        <TokenLabels 
+          tokenData={tokenData}
+          dimensions={dimensions}
+        />
       </svg>
     </div>
-  )
-}
+  );
+};
 
-export const LinkGraph = React.memo(LinkGraphComponent)
+// Memoize the component to prevent unnecessary re-renders
+export const LinkGraph = React.memo(LinkGraphComponent);
+
+// Export function to get SVG string
+export function exportLinkGraphAsSvg(svgElement: SVGSVGElement | null): string | null {
+  if (typeof window === 'undefined' || !svgElement) return null;
+  
+  try {
+    // Clone the SVG to avoid modifying the original
+    const svgClone = svgElement.cloneNode(true) as SVGSVGElement;
+    
+    // Remove tooltips and hover indicators for export (they're interactive elements)
+    const tooltips = svgClone.querySelectorAll('.clerp-tooltip, .hover-indicator');
+    tooltips.forEach(el => el.remove());
+    
+    // Get all computed styles and inline them
+    const styleSheets = Array.from(document.styleSheets);
+    let cssText = '';
+    
+    // Collect relevant CSS rules
+    styleSheets.forEach(sheet => {
+      try {
+        const rules = Array.from(sheet.cssRules || sheet.rules || []);
+        rules.forEach(rule => {
+          if (rule instanceof CSSStyleRule) {
+            const selector = rule.selectorText;
+            // Include styles for nodes, links, and other graph elements
+            if (selector && (
+              selector.includes('.node') ||
+              selector.includes('.link') ||
+              selector.includes('.token-label') ||
+              selector.includes('.position-index') ||
+              selector.includes('.grid-line') ||
+              selector.includes('.y-axis')
+            )) {
+              cssText += `${selector} { ${rule.style.cssText} }\n`;
+            }
+          }
+        });
+      } catch (e) {
+        // Cross-origin stylesheets may throw errors, ignore them
+      }
+    });
+    
+    // Create a style element with the collected CSS
+    if (cssText) {
+      const styleElement = document.createElementNS('http://www.w3.org/2000/svg', 'style');
+      styleElement.textContent = cssText;
+      svgClone.insertBefore(styleElement, svgClone.firstChild);
+    }
+    
+    // Convert to string
+    const serializer = new XMLSerializer();
+    const svgString = serializer.serializeToString(svgClone);
+    
+    // Add XML declaration
+    return '<?xml version="1.0" encoding="UTF-8"?>\n' + svgString;
+  } catch (error) {
+    console.error('Error exporting SVG:', error);
+    return null;
+  }
+} 

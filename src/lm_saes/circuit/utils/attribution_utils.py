@@ -4,8 +4,8 @@ from typing import List, Tuple, Union
 
 import torch
 
-from lm_saes.models.clt import CrossLayerTranscoder
-from lm_saes.models.lorsa import LowRankSparseAttention
+from lm_saes.clt import CrossLayerTranscoder
+from lm_saes.lorsa import LowRankSparseAttention
 
 from .transcoder_set import TranscoderSet
 
@@ -91,9 +91,7 @@ def select_encoder_rows(activations: torch.sparse.Tensor, transcoders: Transcode
     rows: List[torch.Tensor] = []
     for layer, row in enumerate(activations):
         _, feat_idx = row.coalesce().indices()
-
-        # this is only for list of plts. We do this for now to reduce mem overhead
-        rows.append(transcoders[layer].W_E.T[feat_idx])
+        rows.append(transcoders.W_E[layer].T[feat_idx])
     return torch.cat(rows)
 
 
@@ -123,7 +121,7 @@ def select_encoder_rows_lorsa(
 
 
 def compute_partial_influences(edge_matrix, logit_p, row_to_node_index, max_iter=128, device=None):
-    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = device or edge_matrix.device
 
     normalized_matrix = torch.empty_like(edge_matrix, device=device).copy_(edge_matrix)
     normalized_matrix = normalized_matrix.abs_()
@@ -183,7 +181,6 @@ def select_feature_activations(
     return torch.stack(activations)
 
 
-# TODO: remove this function
 def ensure_tokenized(prompt: Union[str, torch.Tensor, List[int]], tokenizer) -> torch.Tensor:
     """Convert *prompt* → 1-D tensor of token ids (no batch dim)."""
 

@@ -1,149 +1,25 @@
-from enum import Enum
 from pathlib import Path
-from typing import (
-    Annotated,
-    Any,
-    Callable,
-    Iterable,
-    Iterator,
-    Optional,
-    Sequence,
-)
+from typing import Any, Callable, Iterable, Iterator, Optional, Sequence
 
 import numpy as np
-import torch
 from datasets import Dataset
-from pydantic import (
-    BaseModel,
-    BeforeValidator,
-    ConfigDict,
-    PlainSerializer,
-    WithJsonSchema,
-)
 
-from lm_saes.backend.language_model import LanguageModel
-from lm_saes.config import BaseConfig
-from lm_saes.utils.misc import (
-    convert_str_to_torch_dtype,
-    convert_torch_dtype_to_str,
-)
-
-from .processors.activation import (
+from lm_saes.activation.processors.activation import (
     ActivationBatchler,
     ActivationGenerator,
     ActivationTransformer,
-    BufferShuffleConfig,
     OverrideDtypeProcessor,
 )
-from .processors.cached_activation import CachedActivationLoader
-from .processors.core import BaseActivationProcessor
-from .processors.huggingface import HuggingFaceDatasetLoader
-
-
-class ActivationFactorySource(BaseModel):
-    type: str
-    """ The type of the source. Used to determine the source of activations in deserialization. """
-    name: str
-    sample_weights: float = 1.0
-    """ The sample weights to use for the source. Will be used to randomly pull tokens from the source when multiple sources are present. """
-
-
-class ActivationFactoryDatasetSource(ActivationFactorySource):
-    type: str = "dataset"
-    is_dataset_tokenized: bool = False
-    """ Whether the dataset is tokenized. Non-tokenized datasets should have records with fields `text`, `images`, etc. Tokenized datasets should have records with fields `tokens`, which could contain either padded or non-padded tokens. """
-    prepend_bos: bool = True
-    """ Whether to prepend the BOS token to each record when tokenizing. """
-
-
-class ActivationFactoryActivationsSource(ActivationFactorySource):
-    model_config = ConfigDict(arbitrary_types_allowed=True)  # allow parsing torch.dtype
-
-    type: str = "activations"
-    path: str | dict[str, str]
-    """ The path to the cached activations. """
-    device: str = "cpu"
-    """ The device to load the activations on. """
-    dtype: Optional[
-        Annotated[
-            torch.dtype,
-            BeforeValidator(lambda v: convert_str_to_torch_dtype(v) if isinstance(v, str) else v),
-            PlainSerializer(convert_torch_dtype_to_str),
-            WithJsonSchema(
-                {
-                    "type": "string",
-                },
-                mode="serialization",
-            ),
-        ]
-    ] = None
-    """ We might want to convert presaved bf16 activations to fp32"""
-    num_workers: int = 4
-    """ The number of workers to use for loading the activations. """
-    prefetch: int | None = 8
-    """ The number of chunks to prefetch."""
-
-
-class ActivationFactoryTarget(Enum):
-    TOKENS = "tokens"
-    """ Output non-padded and non-truncated tokens. """
-    ACTIVATIONS_2D = "activations-2d"
-    """ Output activations in `(batch_size, seq_len, d_model)` shape. Tokens are padded and truncated to the same length. """
-    ACTIVATIONS_1D = "activations-1d"
-    """ Output activations in `(n_filtered_tokens, d_model)` shape. Tokens are filtered in this stage. """
-
-    @property
-    def stage(self) -> int:
-        return {
-            ActivationFactoryTarget.TOKENS: 0,
-            ActivationFactoryTarget.ACTIVATIONS_2D: 1,
-            ActivationFactoryTarget.ACTIVATIONS_1D: 2,
-        }[self]
-
-    def __lt__(self, other: "ActivationFactoryTarget") -> bool:
-        return self.stage < other.stage
-
-    def __le__(self, other: "ActivationFactoryTarget") -> bool:
-        return self.stage <= other.stage
-
-
-class ActivationFactoryConfig(BaseConfig):
-    model_config = ConfigDict(arbitrary_types_allowed=True)  # allow parsing torch.dtype
-
-    sources: list[ActivationFactoryDatasetSource | ActivationFactoryActivationsSource]
-    """ List of sources to use for activations. Can be a dataset or a path to activations. """
-    target: ActivationFactoryTarget
-    """ The target to produce. """
-    hook_points: list[str]
-    """ The hook points to capture activations from. """
-    batch_size: int
-    """ The batch size to use for outputting activations. """
-    num_workers: int = 4
-    """ The number of workers to use for loading the dataset. """
-    context_size: int | None = None
-    """ The context size to use for generating activations. All tokens will be padded or truncated to this size. If `None`, will not pad or truncate tokens. This may lead to some error when re-batching activations of different context sizes."""
-    model_batch_size: int = 1
-    """ The batch size to use for model forward pass when generating activations. """
-    override_dtype: Optional[
-        Annotated[
-            torch.dtype,
-            BeforeValidator(lambda v: convert_str_to_torch_dtype(v) if isinstance(v, str) else v),
-            PlainSerializer(convert_torch_dtype_to_str),
-            WithJsonSchema(
-                {
-                    "type": "string",
-                },
-                mode="serialization",
-            ),
-        ]
-    ] = None
-    """ The dtype to use for outputting activations. If `None`, will not override the dtype. """
-    buffer_size: int | None = None
-    """ Buffer size for online shuffling. If `None`, no shuffling will be performed. """
-    buffer_shuffle: BufferShuffleConfig | None = None
-    """" Manual seed and device of generator for generating randomperm in buffer. """
-    ignore_token_ids: list[int] | None = None
-    """ Tokens to ignore in the activations. """
+from lm_saes.activation.processors.cached_activation import CachedActivationLoader
+from lm_saes.activation.processors.core import BaseActivationProcessor
+from lm_saes.activation.processors.huggingface import HuggingFaceDatasetLoader
+from lm_saes.backend.language_model import LanguageModel
+from lm_saes.config import (
+    ActivationFactoryActivationsSource,
+    ActivationFactoryConfig,
+    ActivationFactoryDatasetSource,
+    ActivationFactoryTarget,
+)
 
 
 class ActivationFactory:
@@ -293,11 +169,11 @@ class ActivationFactory:
 
         return process_activations
 
-    def build_pre_aggregation_processors(self) -> list[Callable]:
+    def build_pre_aggregation_processors(self):
         """Build processors that run before aggregation for each data source.
 
         Returns:
-            List of callables that process data from each source.
+            List of callables that process data from each source
         """
         # Split sources by type
         dataset_sources = [source for source in self.cfg.sources if isinstance(source, ActivationFactoryDatasetSource)]
@@ -313,11 +189,14 @@ class ActivationFactory:
         ]
         return pre_aggregation_processors
 
-    def build_post_aggregation_processor(self) -> Callable:
+    def build_post_aggregation_processor(self):
         """Build processor that runs after aggregation.
 
+        Args:
+            cfg: Factory configuration object
+
         Returns:
-            Callable that processes aggregated data.
+            Callable that processes aggregated data
         """
 
         def build_batchler():
@@ -359,7 +238,7 @@ class ActivationFactory:
 
         return process_activations
 
-    def build_aggregator(self) -> Callable:
+    def build_aggregator(self):
         """Build function to aggregate data from multiple sources.
 
         Returns:
@@ -394,14 +273,14 @@ class ActivationFactory:
 
         return aggregate
 
-    def process(self, **kwargs: Any) -> Iterable:
+    def process(self, **kwargs: Any):
         """Process data through the full pipeline.
 
         Args:
-            **kwargs (Any): Arguments passed to processors (must include required args).
+            **kwargs: Arguments passed to processors (must include required args)
 
         Returns:
-            Iterable of processed activation data.
+            Iterable of processed activation data
         """
         streams = [processor(**kwargs) for processor in self.pre_aggregation_processors]
         stream = self.aggregator(streams)

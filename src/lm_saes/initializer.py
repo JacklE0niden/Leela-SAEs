@@ -1,60 +1,24 @@
-from typing import Dict, Iterable, List, Literal, cast
+from typing import Dict, Iterable, List, cast
 
 import torch
 from torch import Tensor
 from torch.distributed.device_mesh import DeviceMesh
 from transformer_lens import HookedTransformer
 from transformer_lens.components import Attention, GroupedQueryAttention, TransformerBlock
-from transformer_lens.components.mlps.can_be_used_as_mlp import CanBeUsedAsMLP
 from wandb.sdk.wandb_run import Run
 
+from lm_saes.abstract_sae import AbstractSparseAutoEncoder
 from lm_saes.backend.language_model import LanguageModel, TransformerLensLanguageModel
-from lm_saes.config import BaseConfig
-from lm_saes.models.clt import CrossLayerTranscoder
-from lm_saes.models.lorsa import LowRankSparseAttention
-from lm_saes.models.molt import MixtureOfLinearTransform
-from lm_saes.models.protocols import (
-    ActiveSubspaceInitializable,
-    EncoderBiasInitializable,
-    EncoderInitializable,
-    NormConstrainable,
-)
-from lm_saes.models.sae import SparseAutoEncoder
-from lm_saes.models.sparse_dictionary import SparseDictionary, SparseDictionaryConfig
-from lm_saes.utils.distributed.ops import item
+from lm_saes.clt import CrossLayerTranscoder
+from lm_saes.config import BaseSAEConfig, InitializerConfig
+from lm_saes.crosscoder import CrossCoder
+from lm_saes.lorsa import LowRankSparseAttention
+from lm_saes.molt import MixtureOfLinearTransform
+from lm_saes.sae import SparseAutoEncoder
 from lm_saes.utils.logging import get_distributed_logger
 from lm_saes.utils.misc import calculate_activation_norm
 
 logger = get_distributed_logger("initializer")
-
-
-class InitializerConfig(BaseConfig):
-    bias_init_method: Literal["all_zero", "geometric_median"] = "all_zero"
-    """Method for initializing the decoder bias. ``"geometric_median"`` sets the bias to the geometric median of the activation distribution, which is more robust than ``"all_zero"`` for skewed activations."""
-    decoder_uniform_bound: float = 1.0
-    """Half-range of the uniform distribution used to initialize decoder weights, weights are sampled from U(-decoder_uniform_bound, decoder_uniform_bound)."""
-    encoder_uniform_bound: float = 1.0
-    """Half-range of the uniform distribution used to initialize encoder weights, weights are sampled from U(-encoder_uniform_bound, encoder_uniform_bound)."""
-    init_encoder_with_decoder_transpose: bool = True
-    """If ``True``, the encoder weight matrix is initialized as the transpose of the decoder weight matrix (scaled by ``init_encoder_with_decoder_transpose_factor``), providing a better starting point for SAE training."""
-    init_encoder_with_decoder_transpose_factor: float = 1.0
-    """Scaling factor applied to the transposed decoder weights when initializing the encoder."""
-    init_log_jumprelu_threshold_value: float | None = None
-    """Initial value for the log-threshold parameter of JumpReLU activations. Only used when the SAE uses a JumpReLU activation function."""
-    grid_search_init_norm: bool = False
-    """Performs a coarse-then-fine grid search over decoder norms to find the value that minimizes the initial reconstruction loss, then sets the decoder to that norm."""
-    initialize_W_D_with_active_subspace: bool = False
-    """Initializes the decoder weight matrix within the active (high-variance) subspace of the input activations via SVD. Recommended for low-rank activations such as attention outputs to reduce dead features."""
-    d_active_subspace: int | None = None
-    """Dimension of the active subspace used when ``initialize_W_D_with_active_subspace=True``"""
-    initialize_lorsa_with_mhsa: bool | None = None
-    """Initializes the Lorsa QK weights from the target model's attention (MHSA) weights at ``model_layer``."""
-    initialize_tc_with_mlp: bool | None = None
-    """Initializes the transcoder decoder weights from the target model's MLP weights at ``model_layer``."""
-    model_layer: int | None = None
-    """Layer index of the target model from which to extract weights for ``initialize_lorsa_with_mhsa`` or ``initialize_tc_with_mlp``."""
-    init_encoder_bias_with_mean_hidden_pre: bool = False
-    """Initializes the encoder bias to the negative mean of the pre-activation distribution."""
 
 
 class Initializer:
@@ -62,7 +26,7 @@ class Initializer:
         self.cfg = cfg
 
     @torch.no_grad()
-    def initialize_parameters(self, sae: SparseDictionary):
+    def initialize_parameters(self, sae: AbstractSparseAutoEncoder):
         """Initialize the parameters of the SAE.
         Only used when the state is "training" to initialize sae.
         """
@@ -74,9 +38,6 @@ class Initializer:
         )
 
         if self.cfg.init_encoder_with_decoder_transpose:
-            assert isinstance(sae, EncoderInitializable), (
-                f"{type(sae).__name__} does not support encoder initialization from decoder (EncoderInitializable)"
-            )
             sae.init_encoder_with_decoder_transpose(self.cfg.init_encoder_with_decoder_transpose_factor)
 
         return sae
@@ -84,7 +45,7 @@ class Initializer:
     @torch.no_grad()
     def initialization_search(
         self,
-        sae: SparseDictionary,
+        sae: AbstractSparseAutoEncoder,
         activation_batch: Dict[str, Tensor],
         wandb_logger: Run | None = None,
     ):
@@ -115,60 +76,42 @@ class Initializer:
 
         @torch.autocast(device_type=sae.cfg.device, dtype=sae.cfg.dtype)
         def grid_search_best_init_norm(search_range: List[float]) -> float:
-            assert isinstance(sae, NormConstrainable), (
-                f"{type(sae).__name__} does not support norm constraints (NormConstrainable)"
-            )
             losses: Dict[float, float] = {}
 
             for norm in search_range:
                 sae.set_decoder_to_fixed_norm(norm, force_exact=True)
                 if self.cfg.init_encoder_with_decoder_transpose:
-                    assert isinstance(sae, EncoderInitializable)
                     sae.init_encoder_with_decoder_transpose(self.cfg.init_encoder_with_decoder_transpose_factor)
-                if self.cfg.init_encoder_bias_with_mean_hidden_pre:
-                    assert isinstance(sae, EncoderBiasInitializable), (
-                        f"{type(sae).__name__} does not support encoder bias initialization (EncoderBiasInitializable)"
-                    )
-                    sae.init_encoder_bias_with_mean_hidden_pre(batch)
-                mse = item(sae.compute_loss(batch)["l_rec"].mean())
+                mse = sae.compute_loss(batch)[1][0]["l_rec"].mean().item()  # type: ignore
                 losses[norm] = mse
             best_norm = min(losses, key=losses.get)  # type: ignore
             return best_norm
 
         if self.cfg.grid_search_init_norm:
-            best_norm_coarse = grid_search_best_init_norm(torch.linspace(0.1, 5.0, 50).numpy().tolist())
+            best_norm_coarse = grid_search_best_init_norm(torch.linspace(0.1, 1, 10).numpy().tolist())  # type: ignore
             best_norm_fine_grained = grid_search_best_init_norm(
-                torch.linspace(best_norm_coarse - 0.09, best_norm_coarse + 0.1, 20).numpy().tolist()
+                torch.linspace(best_norm_coarse - 0.09, best_norm_coarse + 0.1, 20).numpy().tolist()  # type: ignore
             )
 
             logger.info(f"The best (i.e. lowest MSE) initialized norm is {best_norm_fine_grained}")
             if wandb_logger is not None:
                 wandb_logger.log({"best_norm_fine_grained": best_norm_fine_grained})
 
-            assert isinstance(sae, NormConstrainable)
             sae.set_decoder_to_fixed_norm(best_norm_fine_grained, force_exact=True)
 
         if self.cfg.init_encoder_with_decoder_transpose:
-            assert isinstance(sae, EncoderInitializable), (
-                f"{type(sae).__name__} does not support encoder initialization from decoder (EncoderInitializable)"
-            )
             sae.init_encoder_with_decoder_transpose(self.cfg.init_encoder_with_decoder_transpose_factor)
-
-        if self.cfg.init_encoder_bias_with_mean_hidden_pre:
-            assert isinstance(sae, EncoderBiasInitializable), (
-                f"{type(sae).__name__} does not support encoder bias initialization (EncoderBiasInitializable)"
-            )
-            sae.init_encoder_bias_with_mean_hidden_pre(batch)
 
         return sae
 
     def initialize_sae_from_config(
         self,
-        cfg: SparseDictionaryConfig,
+        cfg: BaseSAEConfig,
         activation_stream: Iterable[dict[str, Tensor]] | None = None,
         activation_norm: dict[str, float] | None = None,
         device_mesh: DeviceMesh | None = None,
         wandb_logger: Run | None = None,
+        fold_activation_scale: bool = False,
         model: LanguageModel | None = None,
     ):
         """
@@ -179,97 +122,112 @@ class Initializer:
             activation_norm (dict[str, float] | None): The activation normalization. Used for dataset-wise normalization when self.cfg.norm_activation is "dataset-wise".
             device_mesh (DeviceMesh | None): The device mesh.
         """
-        sae: SparseDictionary = SparseDictionary.from_config(
+        try:
+            sae_cls = {
+                "sae": SparseAutoEncoder,
+                "crosscoder": CrossCoder,
+                "clt": CrossLayerTranscoder,
+                "lorsa": LowRankSparseAttention,
+                "molt": MixtureOfLinearTransform,
+            }[cfg.sae_type]
+        except KeyError:
+            raise ValueError(f"SAE type {cfg.sae_type} not supported.")
+
+        sae: AbstractSparseAutoEncoder = sae_cls.from_config(
             cfg,
             device_mesh=device_mesh,
+            fold_activation_scale=fold_activation_scale,
         )
 
-        sae = self.initialize_parameters(sae)
-        if sae.cfg.norm_activation == "dataset-wise":
-            if activation_norm is None:
-                assert activation_stream is not None, (
-                    "Activation iterator must be provided for dataset-wise normalization"
-                )
+        if cfg.sae_pretrained_name_or_path is None:
+            sae = self.initialize_parameters(sae)
+            if sae.cfg.norm_activation == "dataset-wise":
+                if activation_norm is None:
+                    assert activation_stream is not None, (
+                        "Activation iterator must be provided for dataset-wise normalization"
+                    )
 
-                activation_norm = calculate_activation_norm(
-                    activation_stream, cfg.associated_hook_points, device_mesh=device_mesh
-                )
-            sae.set_dataset_average_activation_norm(activation_norm)
+                    activation_norm = calculate_activation_norm(
+                        activation_stream, cfg.associated_hook_points, device_mesh=device_mesh
+                    )
+                sae.set_dataset_average_activation_norm(activation_norm)
 
-        if isinstance(sae, LowRankSparseAttention) and self.cfg.initialize_lorsa_with_mhsa:
-            assert sae.cfg.norm_activation == "dataset-wise", (
-                "Norm activation must be dataset-wise for Lorsa if use initialize_lorsa_with_mhsa"
-            )
-            assert isinstance(model, TransformerLensLanguageModel) and model.model is not None, (
-                "Only support TransformerLens backend for initializing Lorsa with Original Multi Head Sparse Attention"
-            )
-            assert self.cfg.model_layer is not None, (
-                "Model layer must be provided for initializing Lorsa with Original Multi Head Sparse Attention"
-            )
-            assert isinstance(model.model, HookedTransformer), "Model must be a TransformerLens model"
-            assert isinstance(model.model.blocks[self.cfg.model_layer], TransformerBlock), (
-                "Block must be a TransformerBlock"
-            )
-            assert isinstance(model.model.blocks[self.cfg.model_layer].attn, Attention | GroupedQueryAttention), (
-                "Attention must be an Attention or GroupedQueryAttention"
-            )
-            sae.init_lorsa_with_mhsa(
-                cast(
-                    Attention | GroupedQueryAttention,
-                    model.model.blocks[self.cfg.model_layer].attn,
-                )
-            )
-
-        assert activation_stream is not None, "Activation iterator must be provided for initialization search"
-        activation_batch = next(iter(activation_stream))  # type: ignore
-
-        if (
-            isinstance(sae, SparseAutoEncoder)
-            and sae.cfg.hook_point_in != sae.cfg.hook_point_out
-            and self.cfg.initialize_tc_with_mlp
-        ):
-            batch = sae.normalize_activations(activation_batch)
-            assert sae.cfg.norm_activation == "dataset-wise"
-            assert isinstance(model, TransformerLensLanguageModel) and model.model is not None
-            assert self.cfg.model_layer is not None
-            assert isinstance(model.model, HookedTransformer), "Model must be a TransformerLens model"
-            assert isinstance(model.model.blocks[self.cfg.model_layer], TransformerBlock), (
-                "Block must be a TransformerBlock"
-            )
-            assert isinstance(model.model.blocks[self.cfg.model_layer].mlp, CanBeUsedAsMLP)
-            sae.init_tc_with_mlp(
-                batch=batch,
-                mlp=cast(CanBeUsedAsMLP, model.model.blocks[self.cfg.model_layer].mlp),
-            )
-
-        if self.cfg.initialize_W_D_with_active_subspace:
-            batch = sae.normalize_activations(activation_batch)
-            if isinstance(sae, LowRankSparseAttention):
+            if isinstance(sae, LowRankSparseAttention) and self.cfg.initialize_lorsa_with_mhsa:
                 assert sae.cfg.norm_activation == "dataset-wise", (
-                    "Norm activation must be dataset-wise for Lorsa if use initialize_W_D_with_active_subspace"
+                    "Norm activation must be dataset-wise for Lorsa if use initialize_lorsa_with_mhsa"
                 )
-                assert isinstance(model, TransformerLensLanguageModel) and model.model is not None, (
-                    "Only support TransformerLens backend for initializing Lorsa decoder weight with active subspace"
-                )
-                assert self.cfg.model_layer is not None, (
-                    "Model layer must be provided for initializing Lorsa decoder weight with active subspace"
-                )
-                sae.init_W_V_with_active_subspace_per_head(
-                    batch=batch,
-                    mhsa=cast(
-                        Attention | GroupedQueryAttention,
-                        model.model.blocks[self.cfg.model_layer].attn,
-                    ),
-                )
-            else:
-                assert self.cfg.d_active_subspace is not None, (
-                    "d_active_subspace must be provided for initializing other SAEs with active subspace"
-                )
-                assert isinstance(sae, ActiveSubspaceInitializable), (
-                    f"{type(sae).__name__} does not support active subspace initialization (ActiveSubspaceInitializable)"
-                )
-                sae.init_W_D_with_active_subspace(batch=batch, d_active_subspace=self.cfg.d_active_subspace)
+                sae.init_lorsa_with_mhsa(model.model.blocks[self.cfg.model_layer])
+                # assert isinstance(model, TransformerLensLanguageModel) and model.model is not None, (
+                #     "Only support TransformerLens backend for initializing Lorsa with Original Multi Head Sparse Attention"
+                # )
+                # assert self.cfg.model_layer is not None, (
+                #     "Model layer must be provided for initializing Lorsa with Original Multi Head Sparse Attention"
+                # )
+                # assert isinstance(model.model, HookedTransformer), "Model must be a TransformerLens model"
+                # assert isinstance(model.model.blocks[self.cfg.model_layer], TransformerBlock), (
+                #     "Block must be a TransformerBlock"
+                # )
+                # assert isinstance(model.model.blocks[self.cfg.model_layer].attn, Attention | GroupedQueryAttention), (
+                    # "Attention must be an Attention or GroupedQueryAttention"
+                # )
+                # sae.init_lorsa_with_mhsa(
+                #     cast(
+                #         Attention | GroupedQueryAttention,
+                #         model.model.blocks[self.cfg.model_layer].attnand model is not None,
+                
+                #     and model is not None)
+                
+                # and model is not None)
+                
+            if isinstance(sae, LowRankSparseAttention) and cfg.use_smolgen and self.cfg.initialize_lorsa_smolgen_from_encoder and model is not None:
+                print(f"====== init_smolgen_from_encoder ======")
+                sae.init_smolgen_from_encoder(model.model.blocks[self.cfg.model_layer])
 
-        sae = self.initialization_search(sae, activation_batch, wandb_logger=wandb_logger)
+            assert activation_stream is not None, "Activation iterator must be provided for initialization search"
+            activation_batch = next(iter(activation_stream))  # type: ignore
+
+            if self.cfg.initialize_W_D_with_active_subspace:
+                batch = sae.normalize_activations(activation_batch)
+                if isinstance(sae, LowRankSparseAttention):
+                    assert sae.cfg.norm_activation == "dataset-wise", (
+                        "Norm activation must be dataset-wise for Lorsa if use initialize_W_D_with_active_subspace"
+                    )
+                    assert isinstance(model, TransformerLensLanguageModel) and model.model is not None, (
+                        "Only support TransformerLens backend for initializing Lorsa decoder weight with active subspace"
+                    )
+                    # assert self.cfg.model_layer is not None, (
+                    #     "Model layer must be provided for initializing Lorsa decoder weight with active subspace"
+                    # )
+                    print(f"====== init_W_D_with_active_subspace_per_head ======")
+                    sae.init_W_D_with_active_subspace_per_head(
+                        activation_batch,
+                        encoder_layer=model.model.blocks[self.cfg.model_layer],
+                    )
+                    # sae.init_W_D_with_active_subspace_per_head(
+                    #     batch,
+                    #     mhsa=cast(
+                    #         Attention | GroupedQueryAttention,
+                    #         model.model.blocks[self.cfg.model_layer].attn,
+                    #     ),
+                    # )
+                else:
+                    assert self.cfg.d_active_subspace is not None, (
+                        "d_active_subspace must be provided for initializing other SAEs with active subspace"
+                    )
+                    sae.init_W_D_with_active_subspace(batch, self.cfg.d_active_subspace)
+
+            if self.cfg.initialize_lorsa_attn_scale_from_encoder:
+                print(f"====== init_attn_scale_from_encoder ======")
+                sae.init_attn_scale_from_encoder(encoder_layer=model.model.blocks[self.cfg.model_layer],)
+            if self.cfg.initialize_W_D_with_mhsa:
+                print(f"====== init_lorsa_W_D_with_mhsa ======")
+                sae.init_lorsa_W_D_with_mhsa(encoder_layer=model.model.blocks[self.cfg.model_layer],)
+
+
+            sae = self.initialization_search(sae, activation_batch, wandb_logger=wandb_logger)
+
+            if self.cfg.init_encoder_bias_with_mean_hidden_pre:
+                batch = sae.normalize_activations(activation_batch)
+                sae.init_encoder_bias_with_mean_hidden_pre(batch)
 
         return sae

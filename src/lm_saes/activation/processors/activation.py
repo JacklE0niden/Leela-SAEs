@@ -1,3 +1,4 @@
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional, cast
 
@@ -5,21 +6,12 @@ import torch
 from more_itertools import batched
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
-from torch.distributed.tensor.experimental import local_map
 from tqdm import tqdm
 
+from lm_saes.activation.processors.core import BaseActivationProcessor
 from lm_saes.backend.language_model import LanguageModel
-from lm_saes.config import BaseConfig
+from lm_saes.config import BufferShuffleConfig
 from lm_saes.utils.distributed import DimMap, mesh_dim_size
-
-from .core import BaseActivationProcessor
-
-
-class BufferShuffleConfig(BaseConfig):
-    perm_seed: int = 42
-    """ Perm seed for aligned permutation for generating activations. If `None`, will not use manual seed for Generator. """
-    generator_device: str | None = None
-    """ The device to be assigned for the torch.Generator. If 'None', generator will be initialized on cpu as pytorch default. """
 
 
 @dataclass
@@ -242,13 +234,17 @@ class ActivationTransformer(BaseActivationProcessor[Iterable[dict[str, Any]], It
         data: Iterable[dict[str, Any]],
         *,
         ignore_token_ids: Optional[list[int]] = None,
+        model: Optional[LanguageModel] = None,
         **kwargs,
     ) -> Iterable[dict[str, Any]]:
         """Process activations by filtering out specified token types.
 
         Args:
             data (Iterable[dict[str, Any]]): Input data containing activations and tokens to process
-            ignore_token_ids (Optional[list[int]], optional): List of token IDs to filter out. If None, filter out masked tokens.
+            ignore_token_ids (Optional[list[int]], optional): List of token IDs to filter out. If None and model
+                is provided, uses model's special tokens (EOS, PAD, BOS). Defaults to None.
+            model (Optional[HookedTransformer], optional): Model to get default special tokens from. Only used
+                if ignore_token_ids is None. Defaults to None.
             **kwargs: Additional keyword arguments. Not used by this processor.
 
         Yields:
@@ -257,24 +253,28 @@ class ActivationTransformer(BaseActivationProcessor[Iterable[dict[str, Any]], It
                 - Original tokens as "tokens"
                 - Original info field if present in input
         """
+        if ignore_token_ids is None and model is None:
+            warnings.warn(
+                "ignore_token_ids are not provided. No tokens (including pad tokens) will be filtered out. If this is intentional, set ignore_token_ids explicitly to an empty list to avoid this warning.",
+                UserWarning,
+                stacklevel=2,
+            )
+        if ignore_token_ids is None and model is not None:
+            ignore_token_ids_optional = [
+                model.eos_token_id,
+                model.pad_token_id,
+                model.bos_token_id,
+            ]
+            ignore_token_ids = [token_id for token_id in ignore_token_ids_optional if token_id is not None]
+        if ignore_token_ids is None:
+            ignore_token_ids = []
         for d in data:
             assert "tokens" in d and isinstance(d["tokens"], torch.Tensor)
             tokens = d["tokens"]
+            mask = torch.ones_like(tokens, dtype=torch.bool)
 
-            if ignore_token_ids is not None:
-                mask = (
-                    cast(
-                        torch.Tensor,
-                        local_map(
-                            lambda x: torch.isin(x, torch.tensor(ignore_token_ids).to(x.device), invert=True),
-                            out_placements=DimMap({"data": 0}).placements(tokens.device_mesh),
-                        )(tokens),
-                    )
-                    if isinstance(tokens, DTensor)
-                    else torch.isin(tokens, torch.tensor(ignore_token_ids).to(tokens.device), invert=True)
-                )
-            else:
-                mask = d["mask"].bool()
+            for token_id in ignore_token_ids:
+                mask &= tokens != token_id
 
             if isinstance(mask, DTensor):
                 # Check if mask is all true

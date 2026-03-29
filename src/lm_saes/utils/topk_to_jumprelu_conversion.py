@@ -6,24 +6,22 @@ from torch import Tensor
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
+from lm_saes.abstract_sae import AbstractSparseAutoEncoder
 from lm_saes.activation_functions import JumpReLU
-from lm_saes.models.clt import CrossLayerTranscoder
-from lm_saes.models.sparse_dictionary import SparseDictionary
-
-from .distributed import distributed_topk
-from .distributed.ops import item
-from .logging import get_distributed_logger
-from .math import topk
+from lm_saes.clt import CrossLayerTranscoder
+from lm_saes.utils.distributed import distributed_topk
+from lm_saes.utils.logging import get_distributed_logger
+from lm_saes.utils.math import topk
 
 logger = get_distributed_logger("utils.topk_to_jumprelu_conversion")
 
 
 @torch.no_grad()
 def topk_to_jumprelu_conversion(
-    sae: SparseDictionary,
+    sae: AbstractSparseAutoEncoder,
     activations_stream: Iterable[dict[str, Tensor]],
     device_mesh: Optional[DeviceMesh] = None,
-) -> SparseDictionary:
+) -> AbstractSparseAutoEncoder:
     """Convert a CLT model from topk to jumprelu.
 
     Args:
@@ -61,7 +59,7 @@ def topk_to_jumprelu_conversion(
 
     origin_rec = sae(x)
 
-    threshold = item(threshold.squeeze())
+    threshold = threshold.squeeze().item()
     logger.info(f"Computed threshold: {threshold}")
 
     sae.cfg.act_fn = "jumprelu"
@@ -84,7 +82,7 @@ def topk_to_jumprelu_conversion(
     converted_rec = sae(x)
 
     logger.info(
-        f"Mean difference between original and converted reconstruction: {item((origin_rec - converted_rec).mean())}"
+        f"Mean difference between original and converted reconstruction: {(origin_rec - converted_rec).mean().item()}"
     )
 
     validation_batch = next(activation_stream)
@@ -93,6 +91,6 @@ def topk_to_jumprelu_conversion(
     feature_acts = sae.encode(x, **encoder_kwargs)
 
     l0 = feature_acts.gt(0).float().sum() / feature_acts.size(0)
-    logger.info(f"converted sae got L0 of {item(l0)}, should be {sae.cfg.top_k}")
+    logger.info(f"converted sae got L0 of {l0.item()}, should be {sae.cfg.top_k}")
 
     return sae

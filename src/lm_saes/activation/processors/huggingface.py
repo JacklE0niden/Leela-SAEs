@@ -6,7 +6,7 @@ from datasets import Dataset
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from .core import BaseActivationProcessor
+from lm_saes.activation.processors.core import BaseActivationProcessor
 
 
 def identity_collate_fn(x):
@@ -86,16 +86,15 @@ class HuggingFaceDatasetLoader(BaseActivationProcessor[Dataset, Iterable[dict[st
 
         if self.with_info:
             flattened = map(
-                lambda x: (
-                    x[1]
-                    | {
-                        "meta": {
-                            "context_idx": x[0],
-                            **({"dataset_name": dataset_name} if dataset_name else {}),
-                            **(metadata if metadata else {}),
-                        }
+                lambda x: x[1]
+                | {
+                    "meta": {
+                        "context_idx": x[0],
+                        **({"dataset_name": dataset_name} if dataset_name else {}),
+                        **(metadata if metadata else {}),
+                        **({"themes": x[1].get("themes")} if "themes" in x[1] else {}),
                     }
-                ),
+                },
                 enumerate(flattened),
             )
 

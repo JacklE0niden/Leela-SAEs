@@ -1,135 +1,27 @@
-import json
 import math
 import os
 from pathlib import Path
-from typing import Annotated, Any, Callable, Iterable, Literal, Tuple
+from typing import Any, Callable, Iterable
 
 import torch
 import torch.distributed.checkpoint as dcp
-import torch.distributed.tensor
 import torch.optim.lr_scheduler as lr_scheduler
-from pydantic import (
-    BeforeValidator,
-    ConfigDict,
-    Field,
-    PlainSerializer,
-    WithJsonSchema,
-)
 from torch import Tensor
 from torch.distributed.checkpoint import FileSystemReader, FileSystemWriter
 from torch.optim import Adam, Optimizer
 from tqdm import tqdm
 from wandb.sdk.wandb_run import Run
 
-from lm_saes.config import BaseConfig
-from lm_saes.metrics import (
-    ExplainedVarianceMetric,
-    FrequencyMetric,
-    GradientNormMetric,
-    L0Metric,
-    L2NormErrorMetric,
-    LossMetric,
-    MeanFeatureActMetric,
-    Metric,
-    ModelSpecificMetric,
-)
-from lm_saes.models.sparse_dictionary import SparseDictionary
-from lm_saes.optim import SparseAdam, clip_grad_norm, get_scheduler
-from lm_saes.utils.distributed import is_primary_rank
-from lm_saes.utils.distributed.ops import item
+from lm_saes.abstract_sae import AbstractSparseAutoEncoder
+from lm_saes.config import TrainerConfig
+from lm_saes.optim import SparseAdam, get_scheduler
+from lm_saes.utils.distributed.ops import full_tensor
 from lm_saes.utils.logging import get_distributed_logger, log_metrics
-from lm_saes.utils.misc import (
-    convert_str_to_torch_dtype,
-    convert_torch_dtype_to_str,
-)
-from lm_saes.utils.tensor_specs import apply_token_mask
+from lm_saes.utils.misc import is_primary_rank
+from lm_saes.utils.tensor_dict import batch_size
 from lm_saes.utils.timer import timer
 
 logger = get_distributed_logger("trainer")
-
-
-class TrainerConfig(BaseConfig):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    l1_coefficient: float | None = 0.00008
-    """Coefficient for the L1 sparsity loss. This loss is used to penalize the sparsity of the feature activations."""
-    l1_coefficient_warmup_steps: int | float = 0.1
-    """Steps (int) or fraction of total steps (float) to warm up the sparsity coefficient from 0."""
-    lp_coefficient: float | None = None
-    """Coefficient for the Lp sparsity loss. This loss is used to . To use the JumpReLU $L^p$ penalty, set lp_coefficient to a positive value."""
-    auxk_coefficient: float | None = None
-    """Coefficient for the Aux-K auxiliary loss. This loss is used to revive dead latents during training. To use the Aux-K loss, set auxk_coefficient to a positive value."""
-    amp_dtype: Annotated[
-        torch.dtype | None,
-        BeforeValidator(lambda v: convert_str_to_torch_dtype(v) if isinstance(v, str) else v),
-        PlainSerializer(convert_torch_dtype_to_str),
-        WithJsonSchema(
-            {
-                "type": ["string", "null"],
-            },
-            mode="serialization",
-        ),
-    ] = Field(default=torch.bfloat16, exclude=True, validate_default=False)
-    sparsity_loss_type: Literal["power", "tanh", "tanh-quad", None] = None
-    tanh_stretch_coefficient: float = 4.0
-    frequency_scale: float = 0.01
-    p: int = 1
-    initial_k: int | float | None = None
-    k_warmup_steps: int | float = 0.1
-    k_cold_booting_steps: int | float = 0
-    k_schedule_type: Literal["linear", "exponential"] = "linear"
-    k_exponential_factor: float = 3.0
-    k_aux: int = 512
-    dead_threshold: float = 10_000_000
-    skip_metrics_calculation: bool = False
-    gradient_accumulation_steps: int = 1
-
-    lr: float | dict[str, float] = 0.0004
-    betas: Tuple[float, float] = (0.9, 0.999)
-    optimizer_class: Literal["adam", "sparseadam"] = "adam"
-    optimizer_foreach: bool = True
-    lr_scheduler_name: Literal[
-        "constant",
-        "constantwithwarmup",
-        "linearwarmupdecay",
-        "cosineannealing",
-        "cosineannealingwarmup",
-        "exponentialwarmup",
-    ] = "constantwithwarmup"
-    lr_end_ratio: float = 1 / 32
-    lr_warm_up_steps: int | float = 5000
-    lr_cool_down_steps: int | float = 0.2
-    jumprelu_lr_factor: float = 1.0
-    clip_grad_norm: float = 0.0
-    feature_sampling_window: int = 1000
-    total_training_tokens: int = 300_000_000
-
-    log_frequency: int = 1000
-    eval_frequency: int = 1000
-    n_checkpoints: int = 10
-    check_point_save_mode: Literal["log", "linear"] = "log"
-
-    from_pretrained_path: str | None = None
-    exp_result_path: str = "results"
-
-    def model_post_init(self, __context):
-        super().model_post_init(__context)
-        Path(self.exp_result_path).mkdir(parents=True, exist_ok=True)
-        Path(self.exp_result_path, "checkpoints").mkdir(parents=True, exist_ok=True)
-        assert self.lr_end_ratio <= 1, "lr_end_ratio must be in 0 to 1 (inclusive)."
-
-        if self.from_pretrained_path is not None:
-            assert os.path.exists(self.from_pretrained_path), (
-                f"from_pretrained_path {self.from_pretrained_path} does not exist"
-            )
-
-
-class WandbConfig(BaseConfig):
-    wandb_project: str = "gpt2-sae-training"
-    exp_name: str | None = None
-    wandb_entity: str | None = None
-    wandb_run_id: str | None = None
-    wandb_resume: Literal["allow", "must", "never", "auto"] = "never"
 
 
 class Trainer:
@@ -147,12 +39,8 @@ class Trainer:
         self.optimizer: Optimizer | None = None
         self.scheduler: lr_scheduler.LRScheduler | None = None
         self.wandb_logger: Run | None = None
-        self.metrics: list[Metric] = []
-        # Dead statistics for auxk loss
-        self.tokens_since_last_activation: Tensor | None = None
-        self.is_dead: Tensor | None = None
 
-    def save_checkpoint(self, sae: SparseDictionary, checkpoint_path: Path | str) -> None:
+    def save_checkpoint(self, sae: AbstractSparseAutoEncoder, checkpoint_path: Path | str) -> None:
         """
         Save a complete checkpoint including model, optimizer, scheduler, and
         trainer state.
@@ -171,9 +59,9 @@ class Trainer:
         sae.cfg.save_hyperparameters(checkpoint_dir)
         # Save model state
         if sae.device_mesh is None:
-            sae.save_checkpoint(checkpoint_dir / "sae_weights.safetensors")
+            sae.save_checkpoint(Path(checkpoint_dir) / "sae_weights.safetensors")
         else:
-            sae.save_checkpoint(checkpoint_dir / "sae_weights.dcp")
+            sae.save_checkpoint(Path(checkpoint_dir) / "sae_weights.dcp")
 
         if is_primary_rank(sae.device_mesh):
             # Prepare trainer state
@@ -189,12 +77,11 @@ class Trainer:
                 "checkpoint_thresholds": self.checkpoint_thresholds,
                 "cfg": self.cfg,
             }
+
             # Save trainer state
             trainer_path = checkpoint_dir / "trainer.pt"
             torch.save(trainer_state, trainer_path)
-            if self.wandb_logger is not None:
-                with open(checkpoint_dir / "wandb_run_id.json", "w") as f:
-                    json.dump({"wandb_run_id": self.wandb_logger.id}, f)
+
         # Save optimizer state - handle distributed tensors
         if self.optimizer is not None:
             if sae.device_mesh is None:
@@ -226,7 +113,7 @@ class Trainer:
     @classmethod
     def from_checkpoint(
         cls,
-        sae: SparseDictionary,
+        sae: AbstractSparseAutoEncoder,
         checkpoint_path: str,
     ) -> "Trainer":
         """
@@ -234,11 +121,11 @@ class Trainer:
         trainer state.
 
         Args:
-            sae (SparseDictionary): The SAE model instance.
-            checkpoint_path (str): Path where the checkpoint was saved (without extension).
+            device_mesh: The device mesh to load the model into
+            checkpoint_path: Path where the checkpoint was saved (without extension)
 
         Returns:
-            Trainer: A new trainer instance with loaded state.
+            Trainer: A new trainer instance with loaded state
         """
         # Load trainer state first to get the config
         checkpoint_dir = Path(checkpoint_path)
@@ -309,17 +196,11 @@ class Trainer:
     @timer.time("initialize_trainer")
     def _initialize_trainer(
         self,
-        sae: SparseDictionary,
+        sae: AbstractSparseAutoEncoder,
         activation_stream: Iterable[dict[str, Tensor]],
         wandb_logger: Run | None = None,
     ):
-        batch = next(iter(activation_stream))
-        bs = batch["tokens"].numel()
-        if batch["mask"].numel() != batch["mask"].sum():
-            logger.warning(
-                "We are training with batches of varying length. So we will not use as many as `self.cfg.total_training_tokens` for training as we assume each batch is full to estimate training steps. `details/n_training_tokens` is accurate in this case."
-            )
-
+        bs = batch_size(next(iter(activation_stream)))
         self.total_training_steps = self.cfg.total_training_tokens // bs
 
         def calculate_warmup_steps(warmup_steps: float | int) -> int:
@@ -336,7 +217,7 @@ class Trainer:
         if self.cfg.n_checkpoints > 0:
             if self.cfg.check_point_save_mode == "linear":
                 self.checkpoint_thresholds = list(
-                    range(0, self.total_training_steps, self.total_training_steps // self.cfg.n_checkpoints)
+                    range(0, self.cfg.total_training_tokens, self.cfg.total_training_tokens // self.cfg.n_checkpoints)
                 )[1:]
             elif self.cfg.check_point_save_mode == "log":
                 self.checkpoint_thresholds = [
@@ -346,7 +227,7 @@ class Trainer:
         self.wandb_logger = wandb_logger
 
     @timer.time("initialize_optimizer")
-    def _initialize_optimizer(self, sae: SparseDictionary):
+    def _initialize_optimizer(self, sae: AbstractSparseAutoEncoder):
         assert isinstance(self.cfg.lr, float)
 
         def _apply_lr(parameters: dict[str, Any]):
@@ -400,63 +281,10 @@ class Trainer:
         self.optimizer = optimizer
         self.scheduler = scheduler
 
-    def _initialize_dead_statistics(self, sae: SparseDictionary) -> None:
-        """Initialize the dead statistics tracking variables for auxk loss.
-
-        Args:
-            sae: The sparse autoencoder model to get the d_sae dimension from.
-        """
-        if sae.device_mesh is None:
-            self.tokens_since_last_activation = torch.zeros(sae.cfg.d_sae, device=sae.cfg.device, dtype=torch.long)
-            self.is_dead = torch.zeros(sae.cfg.d_sae, device=sae.cfg.device, dtype=torch.bool)
-        else:
-            from lm_saes.utils.distributed import DimMap
-
-            self.tokens_since_last_activation = torch.distributed.tensor.zeros(
-                sae.cfg.d_sae,
-                dtype=torch.long,
-                device_mesh=sae.device_mesh,
-                placements=DimMap({"model": 0}).placements(sae.device_mesh),
-            )
-            self.is_dead = torch.distributed.tensor.zeros(
-                sae.cfg.d_sae,
-                dtype=torch.bool,
-                device_mesh=sae.device_mesh,
-                placements=DimMap({"model": 0}).placements(sae.device_mesh),
-            )
-
-    @torch.no_grad()
-    def update_dead_statistics(self, feature_acts: Tensor, mask: Tensor | None, specs: tuple[str, ...]) -> Tensor:
-        """Update the dead latents tracking based on current feature activations.
-
-        Args:
-            feature_acts: Feature activations tensor of shape (batch, d_sae) or (batch, seq_len, d_sae)
-
-        Returns:
-            is_dead: Boolean tensor indicating which features are dead.
-        """
-        assert self.tokens_since_last_activation is not None, (
-            "tokens_since_last_activation must be initialized before calling update_dead_statistics"
-        )
-        assert self.is_dead is not None, "is_dead must be initialized before calling update_dead_statistics"
-
-        valid_tokens = mask.sum() if mask is not None else feature_acts[..., 0].numel()
-
-        feature_acts_sum, _ = apply_token_mask(feature_acts, specs, mask, "sum")
-        activated = feature_acts_sum.gt(0)
-
-        self.tokens_since_last_activation = torch.where(
-            activated,
-            torch.zeros_like(self.tokens_since_last_activation),
-            self.tokens_since_last_activation + valid_tokens,
-        )
-        self.is_dead = self.tokens_since_last_activation >= self.cfg.dead_threshold
-        return self.is_dead
-
     @timer.time("training_step")
     def _training_step(
         self,
-        sae: SparseDictionary,
+        sae: AbstractSparseAutoEncoder,
         batch: dict[str, Tensor],
     ) -> dict[str, Tensor]:
         if "topk" in sae.cfg.act_fn and self.k_warmup_steps > 0:
@@ -492,78 +320,150 @@ class Trainer:
 
         lp_coefficient = self.cfg.lp_coefficient if self.cfg.lp_coefficient is not None else 0.0
 
-        auxk_coefficient = self.cfg.auxk_coefficient if self.cfg.auxk_coefficient is not None else 0.0
-
-        ctx = sae.compute_loss(
+        loss, (loss_data, aux_data) = sae.compute_loss(
             batch,
             sparsity_loss_type=self.cfg.sparsity_loss_type,
             tanh_stretch_coefficient=self.cfg.tanh_stretch_coefficient,
             p=self.cfg.p,
+            use_batch_norm_mse=self.cfg.use_batch_norm_mse,
             return_aux_data=True,
             l1_coefficient=l1_coefficient,
             lp_coefficient=lp_coefficient,
-            auxk_coefficient=auxk_coefficient,
             frequency_scale=self.cfg.frequency_scale,
-            k_aux=self.cfg.k_aux,
-            update_dead_statistics=self.update_dead_statistics if auxk_coefficient > 0.0 else None,
         )
-        return ctx
+
+        loss_dict = (
+            {
+                "loss": loss,
+                "batch_size": batch_size(batch),
+                "l1_coefficient": l1_coefficient,
+                "lp_coefficient": lp_coefficient,
+            }
+            | loss_data
+            | aux_data
+        )
+        return loss_dict
 
     @torch.no_grad()
     @timer.time("log")
-    def _log(self, sae: SparseDictionary, ctx: dict[str, Any]):
+    def _log(self, sae: AbstractSparseAutoEncoder, log_info: dict, batch: dict[str, Tensor]):
         """Log training metrics and sparsity statistics.
 
         Delegates model-specific logging to the model's methods.
         """
         assert self.optimizer is not None, "Optimizer must be initialized"
+        label = sae.prepare_label(batch)
 
-        # Initialize metrics on first call
-        if not self.metrics:
-            self.metrics = [
-                FrequencyMetric(sae),
-                LossMetric(sae),
-                MeanFeatureActMetric(sae),
-                ExplainedVarianceMetric(sae),
-                L0Metric(sae),
-                L2NormErrorMetric(sae),
-                ModelSpecificMetric(sae),
-                GradientNormMetric(sae),
-            ]
+        # Prepare logging data (model-specific transformations)
+        log_info, label = sae.prepare_logging_data(log_info.copy(), label)
 
-        for metric in self.metrics:
-            ctx = {**ctx, **metric.update(ctx)}
+        # Compute activation frequency scores
+        act_freq_scores = sae.compute_activation_frequency_scores(log_info["feature_acts"])
+        act_freq_scores = full_tensor(act_freq_scores)
 
-        if (self.cur_step + 1) % self.cfg.log_frequency == 0:
-            metrics = {}
+        log_info["act_freq_scores"] += act_freq_scores
+        log_info["n_frac_active_tokens"] += log_info["batch_size"]
 
-            for metric in self.metrics:
-                metrics.update(metric.compute())
-
-            metrics.update(
-                {
-                    "details/current_learning_rate": self.optimizer.param_groups[0]["lr"],
-                    "details/n_training_tokens": self.cur_tokens,
-                    "details/l1_coefficient": ctx.get("l1_coefficient"),
-                    "details/lp_coefficient": ctx.get("lp_coefficient"),
-                    "details/auxk_coefficient": ctx.get("auxk_coefficient"),
-                }
-            )
-
-            metrics.update(sae.log_statistics())
+        # Log sparsity metrics periodically
+        if (self.cur_step + 1) % self.cfg.feature_sampling_window == 0:
+            feature_sparsity = log_info["act_freq_scores"] / log_info["n_frac_active_tokens"]
+            wandb_log_dict = sae.compute_sparsity_metrics(feature_sparsity)
 
             if is_primary_rank(sae.device_mesh):
-                log_metrics(logger.logger, metrics, step=self.cur_step + 1, title="Training Metrics")
+                log_metrics(logger.logger, wandb_log_dict, step=self.cur_step + 1, title="Sparsity Metrics")
+            if self.wandb_logger is not None:
+                self.wandb_logger.log(wandb_log_dict, step=self.cur_step + 1)
+            log_info["act_freq_scores"].zero_()
+            log_info["n_frac_active_tokens"].zero_()
+
+        # Log training metrics periodically
+        if (self.cur_step + 1) % self.cfg.log_frequency == 0:
+            feature_acts = log_info["feature_acts"]
+            reconstructed = log_info["reconstructed"]
+
+            # Convert DTensors to regular tensors for computation
+            feature_acts = full_tensor(feature_acts)
+            reconstructed = full_tensor(reconstructed)
+            label = full_tensor(label)
+
+            # Compute common metrics
+            act_feature_counts = feature_acts.gt(0).float().sum()
+            mean_feature_act = feature_acts.sum() / act_feature_counts
+            mean_feature_act = full_tensor(mean_feature_act)
+
+            l0 = (feature_acts > 0).float().sum(-1)
+            l0 = full_tensor(l0)
+
+            l_rec = full_tensor(log_info["l_rec"])
+            l_s = full_tensor(log_info.get("l_s", None)) if log_info.get("l_s", None) is not None else None  # pyright: ignore[reportArgumentType]
+            l_p = full_tensor(log_info.get("l_p", None)) if log_info.get("l_p", None) is not None else None  # pyright: ignore[reportArgumentType]
+
+            # Compute reconstruction metrics
+            per_token_l2_loss = (reconstructed - label).pow(2).sum(dim=-1)
+            total_variance = (label - label.mean(dim=0)).pow(2).sum(dim=-1)
+            l2_norm_error = per_token_l2_loss.sqrt().mean()
+            l2_norm_error_ratio = l2_norm_error / label.norm(p=2, dim=-1).mean()
+            explained_variance_legacy = 1 - per_token_l2_loss / total_variance
+            l2_loss_mean = per_token_l2_loss.mean(dim=0)
+            total_variance_mean = total_variance.mean(dim=0)
+            if torch.any(torch.isinf(total_variance_mean)):
+                logger.warning("Some of total_variance_mean is inf. Check dtype or scaling.")
+            explained_variance = 1 - l2_loss_mean / total_variance_mean
+
+            # Add model-specific training metrics (may modify l0 shape)
+            model_metrics = sae.compute_training_metrics(
+                feature_acts=feature_acts,
+                reconstructed=reconstructed,
+                label=label,
+                l_rec=l_rec,
+                l0=l0,
+                explained_variance=explained_variance,
+                explained_variance_legacy=explained_variance_legacy,
+            )
+
+            # Aggregate l0 for overall metric if needed (e.g., CLT sums over layers)
+            l0_for_overall = sae.aggregate_l0(l0)
+
+            # Build base metrics dictionary
+            wandb_log_dict = {
+                # losses
+                "losses/mse_loss": l_rec.mean().item(),
+                **({"losses/sparsity_loss": l_s.mean().item()} if l_s is not None else {}),
+                **({"losses/lp_loss": l_p.mean().item()} if l_p is not None else {}),
+                "losses/overall_loss": full_tensor(log_info["loss"]).item(),
+                # variance explained
+                "metrics/explained_variance": explained_variance.mean().item(),
+                "metrics/explained_variance_legacy": explained_variance_legacy.mean().item(),
+                # sparsity
+                "metrics/l0": l0_for_overall.mean().item(),
+                "metrics/mean_feature_act": mean_feature_act.item(),
+                "metrics/l2_norm_error": l2_norm_error.item(),
+                "metrics/l2_norm_error_ratio": l2_norm_error_ratio.item(),
+                # details
+                "details/current_learning_rate": self.optimizer.param_groups[0]["lr"],
+                "details/n_training_tokens": self.cur_tokens,
+                "details/l1_coefficient": log_info["l1_coefficient"],
+                "details/lp_coefficient": log_info["lp_coefficient"],
+            }
+
+            # Add model-specific metrics
+            wandb_log_dict.update(model_metrics)
+
+            # Add timer information
+            wandb_log_dict.update(sae.log_statistics())
+
+            if is_primary_rank(sae.device_mesh):
+                log_metrics(logger.logger, wandb_log_dict, step=self.cur_step + 1, title="Training Metrics")
 
             if timer.enabled:
                 logger.info(f"\nTimer Summary:\n{timer.summary()}\n")
 
             if self.wandb_logger is not None:
-                self.wandb_logger.log(metrics, step=self.cur_step + 1)
+                self.wandb_logger.log(wandb_log_dict, step=self.cur_step + 1)
 
     @timer.time("save_checkpoint")
-    def _maybe_save_sae_checkpoint(self, sae: SparseDictionary):
-        if len(self.checkpoint_thresholds) > 0 and self.cur_step >= self.checkpoint_thresholds[0]:
+    def _maybe_save_sae_checkpoint(self, sae: AbstractSparseAutoEncoder):
+        if len(self.checkpoint_thresholds) > 0 and self.cur_tokens >= self.checkpoint_thresholds[0]:
             suffix = "safetensors" if sae.device_mesh is None else "dcp"
             path = os.path.join(
                 self.cfg.exp_result_path,
@@ -575,9 +475,9 @@ class Trainer:
 
     def fit(
         self,
-        sae: SparseDictionary,
+        sae: AbstractSparseAutoEncoder,
         activation_stream: Iterable[dict[str, Tensor]],
-        eval_fn: Callable[[SparseDictionary], None] | None = None,
+        eval_fn: Callable[[AbstractSparseAutoEncoder], None] | None = None,
         wandb_logger: Run | None = None,
     ) -> bool | None:
         # Reset timer at the start of training
@@ -588,14 +488,22 @@ class Trainer:
             self._initialize_trainer(sae, activation_stream, wandb_logger)
             self._initialize_optimizer(sae)
 
-        # Initialize dead statistics for auxk loss
-        if self.cfg.auxk_coefficient is not None and self.cfg.auxk_coefficient > 0.0:
-            self._initialize_dead_statistics(sae)
-
         assert self.optimizer is not None and self.scheduler is not None, (
             "Optimizer and scheduler should be already initialized"
         )
 
+        maybe_local_d_sae = sae.cfg.d_sae  # if sae.device_mesh is None else sae.cfg.d_sae // sae.device_mesh.size()
+        if sae.cfg.sae_type == "clt":
+            act_freq_scores_shape = (
+                sae.cfg.n_layers,  # type: ignore
+                maybe_local_d_sae,
+            )
+        else:
+            act_freq_scores_shape = (maybe_local_d_sae,)  # type: ignore
+        log_info = {
+            "act_freq_scores": torch.zeros(act_freq_scores_shape, device=sae.cfg.device, dtype=sae.cfg.dtype),
+            "n_frac_active_tokens": torch.tensor([0], device=sae.cfg.device, dtype=torch.int),
+        }
         proc_bar = tqdm(total=self.total_training_steps, smoothing=0.001, disable=not is_primary_rank(sae.device_mesh))
         proc_bar.update(self.cur_step)
 
@@ -611,25 +519,31 @@ class Trainer:
                     sae.train()
 
                     with torch.autocast(device_type=sae.cfg.device, dtype=self.cfg.amp_dtype):
-                        ctx = self._training_step(sae, batch)
+                        loss_dict = self._training_step(sae, batch)
 
-                    # Get GPU memory usage if available
-                    mem_info = ""
-                    if torch.cuda.is_available():
-                        mem_allocated = torch.cuda.memory_allocated() / 1024**3  # GB
-                        mem_reserved = torch.cuda.memory_reserved() / 1024**3  # GB
-                        mem_info = f", mem: {mem_allocated:.2f}/{mem_reserved:.2f}GB"
-
+                    log_info.update(loss_dict)
                     proc_bar.set_description(
-                        f"loss: {item(ctx['loss']):.2f}, lr: {self.optimizer.param_groups[0]['lr']:.2e}{mem_info}"
+                        f"loss: {log_info['loss'].item():.2f}, learning rate: {self.optimizer.param_groups[0]['lr']:.2e}"
                     )
 
+                    if not self.cfg.skip_metrics_calculation:
+                        with torch.autocast(device_type=sae.cfg.device, dtype=self.cfg.amp_dtype):
+                            self._log(sae, log_info, batch)
+
+                    with timer.time("refresh_batch"):
+                        del batch
+                        batch = next(activation_stream)
+
                     with timer.time("backward"):
-                        ctx["loss"].backward()
+                        loss_dict["loss"].backward()
 
                     with timer.time("clip_grad_norm"):
                         # exclude the grad of the jumprelu threshold
-                        ctx["grad_norm_before_clipping"] = clip_grad_norm(
+                        # print(f'{self.cfg.clip_grad_norm = }')
+                        assert sae.device_mesh is None or self.cfg.clip_grad_norm <= 0, (
+                            "clip_grad_norm must be 0 for distributed training"
+                        )
+                        loss_dict["grad_norm"] = torch.nn.utils.clip_grad_norm_(
                             [
                                 param
                                 for name, param in sae.named_parameters()
@@ -637,10 +551,6 @@ class Trainer:
                             ],
                             max_norm=self.cfg.clip_grad_norm if self.cfg.clip_grad_norm > 0 else math.inf,
                         )
-
-                    if not self.cfg.skip_metrics_calculation:
-                        with torch.autocast(device_type=sae.cfg.device, dtype=self.cfg.amp_dtype):
-                            self._log(sae, ctx)
 
                     with timer.time("optimizer_step"):
                         self.optimizer.step()
@@ -650,19 +560,14 @@ class Trainer:
                         with timer.time("evaluation"):
                             eval_fn(sae)
 
+                    self._maybe_save_sae_checkpoint(sae)
                     with timer.time("scheduler_step"):
                         self.scheduler.step()
-                    self.cur_step += 1
-                    self.cur_tokens += (
-                        batch["tokens"].numel() if batch.get("mask") is None else int(item(batch["mask"].sum()))
-                    )
 
-                    self._maybe_save_sae_checkpoint(sae)
-                    if self.cur_step >= self.total_training_steps:
+                    self.cur_step += 1
+                    self.cur_tokens += batch_size(batch)
+                    if self.cur_tokens >= self.cfg.total_training_tokens:
                         break
-                    with timer.time("refresh_batch"):
-                        del batch
-                        batch = next(activation_stream)
         except StopIteration:
             logger.info("the current stream has ended")
             return True

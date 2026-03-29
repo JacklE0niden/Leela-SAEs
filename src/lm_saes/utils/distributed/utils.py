@@ -1,23 +1,11 @@
 import functools
 import operator
-from typing import Any, Callable, Optional, cast
+from typing import Any, Optional, cast
 
 import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import Placement
-
-
-def is_primary_rank(device_mesh: DeviceMesh | None, dim_name: str = "sweep") -> bool:
-    """Check if the current rank is the primary rank for the given mesh dimension."""
-    if device_mesh is None:
-        return True
-    coord = device_mesh.get_coordinate()
-    mesh_dim_names = device_mesh.mesh_dim_names
-    if coord is None or mesh_dim_names is None:
-        return False
-    coord = [c for i, c in enumerate(coord) if dim_name not in mesh_dim_names or i != mesh_dim_names.index(dim_name)]
-    return all(c == 0 for c in coord)
 
 
 def all_gather_dict(
@@ -163,98 +151,3 @@ def replace_placements(
             new_placement if i == device_mesh.mesh_dim_names.index(mesh_dim) else p for i, p in enumerate(placements)
         )
     return placements
-
-
-# Cache for process groups to avoid recreating them
-_process_group_cache: dict[tuple[int, tuple[str, ...]], dist.ProcessGroup] = {}
-
-
-def get_mesh_ranks(device_mesh: DeviceMesh, mesh_dim: list[str]) -> list[int]:
-    """Get global ranks for processes spanning specified mesh dimensions.
-
-    Fixes dimensions not in mesh_dim to current coordinate, iterates over mesh_dim dimensions.
-
-    Args:
-        device_mesh: Device mesh to query.
-        mesh_dim: List of dimension names to span.
-
-    Returns:
-        List of global ranks participating in the group.
-
-    Example:
-        For a 2×4 mesh [[0,1,2,3], [4,5,6,7]] with dims ["dp", "tp"]:
-        - coord (0,1), mesh_dim=["dp"] -> [1, 5]
-        - coord (0,1), mesh_dim=["tp"] -> [0, 1, 2, 3]
-        - coord (0,1), mesh_dim=["dp","tp"] -> [0, 1, 2, 3, 4, 5, 6, 7]
-    """
-    assert device_mesh.mesh_dim_names is not None, "Device mesh does not have mesh dimension names"
-    assert all(dim in device_mesh.mesh_dim_names for dim in mesh_dim), (
-        f"Mesh dimensions {mesh_dim} not found in device mesh"
-    )
-
-    coord = device_mesh.get_coordinate()
-    assert coord is not None, "Device mesh does not have coordinate"
-
-    mesh_dim_indices = [device_mesh.mesh_dim_names.index(dim) for dim in mesh_dim]
-
-    # Fix non-mesh_dim dimensions to current coord, span mesh_dim dimensions
-    indices = [slice(None) if i in mesh_dim_indices else coord[i] for i in range(len(coord))]
-
-    ranks_tensor = device_mesh.mesh[tuple(indices)]
-    print(f"rank: {dist.get_rank()}, ranks: {ranks_tensor.flatten().tolist()}")
-    return ranks_tensor.flatten().tolist()
-
-
-def get_process_group(
-    device_mesh: DeviceMesh, mesh_dim: str | list[str] | None = None
-) -> torch.distributed.ProcessGroup:
-    """Get process group for specified mesh dimensions.
-
-    Args:
-        device_mesh: Device mesh to query.
-        mesh_dim: Dimension name(s). If None, uses all dimensions.
-                  If str, uses device_mesh.get_group().
-                  If list, creates new group via get_mesh_ranks() and caches the result.
-
-    Returns:
-        Process group for the specified dimensions.
-    """
-    assert device_mesh.mesh_dim_names is not None, "Device mesh does not have mesh dimension names"
-    if isinstance(mesh_dim, str):
-        assert mesh_dim in device_mesh.mesh_dim_names, f"Mesh dimension {mesh_dim} not found in device mesh"
-        return device_mesh.get_group(mesh_dim)
-    else:
-        mesh_dim = mesh_dim if mesh_dim is not None else list(device_mesh.mesh_dim_names)
-
-        # Use cache to avoid recreating process groups
-        cache_key = (id(device_mesh), tuple(sorted(mesh_dim)))
-        if cache_key in _process_group_cache:
-            return _process_group_cache[cache_key]
-
-        ranks = get_mesh_ranks(device_mesh, mesh_dim)
-        pg = cast(dist.ProcessGroup, dist.new_group(ranks=ranks))
-        _process_group_cache[cache_key] = pg
-        return pg
-
-
-def get_primary_process_group(device_mesh: DeviceMesh, mesh_dim_name: str) -> dist.ProcessGroup:
-    """Get the process group that divides the device mesh along the given dimension. This should be the complement of `get_process_group` on the given dimension."""
-
-    assert device_mesh.mesh_dim_names is not None, "Device mesh does not have mesh dimension names"
-    mesh_dim_names = [name for name in device_mesh.mesh_dim_names if name != mesh_dim_name]
-    return get_process_group(device_mesh, mesh_dim_names)
-
-
-def execute_and_broadcast(
-    func: Callable[..., Any],
-    device_mesh: DeviceMesh | None,
-    mesh_dim_name: str = "sweep",
-    **kwargs,
-) -> Any:
-    """Execute a function in the primary rank and broadcast the result to all ranks. If the device mesh is None, the function simply executes the function and returns the result."""
-    if device_mesh is None:
-        return func(**kwargs)
-    group = get_primary_process_group(device_mesh, mesh_dim_name)
-    return broadcast_object(
-        func(**kwargs) if is_primary_rank(device_mesh, dim_name=mesh_dim_name) else None, group_src=0, group=group
-    )

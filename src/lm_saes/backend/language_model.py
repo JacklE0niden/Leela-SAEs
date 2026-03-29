@@ -1,39 +1,11 @@
-from __future__ import annotations
-
-import json
-import os
 import re
 import warnings
 from abc import ABC, abstractmethod
-from collections import defaultdict
-from contextlib import contextmanager
-from dataclasses import dataclass, field, replace
 from itertools import accumulate
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Callable,
-    Iterator,
-    Literal,
-    Optional,
-    Self,
-    Sequence,
-    Union,
-    cast,
-    overload,
-)
+from typing import Any, Optional, cast
+import os
 
-import einops
 import torch
-import torch.distributed as dist
-import torch.utils._pytree as pytree
-from huggingface_hub import hf_hub_download
-from torch._tensor import Tensor
-from torch.distributed import DeviceMesh
-from torch.distributed.tensor import DTensor
-from torch.distributed.tensor.experimental import local_map
-from torch.types import Number
-from tqdm import tqdm
 from transformer_lens import HookedTransformer
 from transformers import (
     AutoModelForCausalLM,
@@ -43,59 +15,133 @@ from transformers import (
     Qwen2_5_VLForConditionalGeneration,
 )
 
-from lm_saes.backend.hooks import apply_saes, detach_at
-from lm_saes.backend.tl_addons import run_with_cache_until, run_with_ref_cache
-from lm_saes.config import BaseModelConfig
-from lm_saes.utils.auto import PretrainedSAEType, auto_infer_pretrained_sae_type
-from lm_saes.utils.discrete import DiscreteMapper
-from lm_saes.utils.distributed import DimMap
-from lm_saes.utils.misc import ensure_tokenized, pad_and_truncate_tokens, tensor_id
+from transformer_lens.components import SearchlessChessBehavioralCloningTokenizer, LeelaBoard, LeelaEmbed
+from lm_saes.config import LanguageModelConfig, LLaDAConfig
+from lm_saes.utils.misc import pad_and_truncate_tokens
+from lm_saes.utils.timer import timer
 
-if TYPE_CHECKING:
-    from lm_saes.models.lorsa import LowRankSparseAttention
-    from lm_saes.models.molt import MixtureOfLinearTransform
-    from lm_saes.models.sae import SparseAutoEncoder
-    from lm_saes.models.sparse_dictionary import SparseDictionary
+def fen_to_longfen_behavioral_cloning(fen: str) -> str:
+    '''
+    input: fen
+    output: longfen(wrnbqkbnrpppppppp................................PPPPPPPPRNBQKBNRKQkq..0..1..0)
+    '''
+    parts = fen.split()
+    board_fen = parts[0]  # chessboard
+    active_color = parts[1]  # current player (w/b)
+    castling = parts[2]  # castling rights
+    en_passant = parts[3]  # en passant target square
+    halfmove = parts[4]  # halfmove count
+    fullmove = parts[5]  # fullmove count
+    
+    # convert chessboard part (8x8 = 64 characters)
+    longfen_board = ""
+    for char in board_fen:
+        if char == '/':
+            continue  # skip row separator
+        elif char.isdigit():
+            # number represents consecutive empty spaces
+            longfen_board += '.' * int(char)
+        else:
+            # piece characters are added directly
+            longfen_board += char
+    
+    # ensure the chessboard part has exactly 64 characters
+    assert len(longfen_board) == 64, f"chessboard should have 64 characters, actually has {len(longfen_board)}"
+    
+    # handle castling rights (4 characters: KQkq)
+    castling_longfen = ""
+    for right in ['K', 'Q', 'k', 'q']:
+        if right in castling:
+            castling_longfen += right
+        else:
+            castling_longfen += '.'
+    
+    # handle en passant (2 characters)
+    if en_passant == '-':
+        en_passant_longfen = ".."
+    else:
+        en_passant_longfen = en_passant
+    
+    # handle halfmove and fullmove counts (each 3 characters)
+    halfmove_padded = halfmove.ljust(3, '.')  # left aligned, right padded with .
+    fullmove_padded = fullmove.ljust(3, '.')  # left aligned, right padded with .
+
+    longfen_behavioral_cloning = (
+        active_color +  # current player (1 character)
+        longfen_board +  # chessboard (64 characters)
+        castling_longfen +  # castling rights (4 characters)
+        en_passant_longfen +  # en passant (2 characters)
+        halfmove_padded +  # halfmove (3 characters)
+        fullmove_padded +  # fullmove (3 characters)
+        # move +  # move (1 character)
+        "0"  # end marker
+    )
+    
+    return longfen_behavioral_cloning
+
+def fen_to_board_str(fen: str) -> str:
+    '''
+    input: fen
+    output: board_str(wrnbqkbnrpppppppp................................PPPPPPPPRNBQKBNRKQkq..0..1..0)
+    '''
+    parts = fen.split()
+    board_fen = parts[0]  # chessboard part    
+    
+    board_str = ""
+    for char in board_fen:
+        if char == '/':
+            continue  # skip row separator
+        elif char.isdigit():
+            # number represents consecutive empty spaces
+            board_str += '.' * int(char)
+        else:
+            # piece characters are added directly
+            board_str += char   
+    return board_str
 
 
-def to_tokens(tokenizer, text, max_length, device="cpu", prepend_bos=True):
+def get_input_with_manually_prepended_bos(tokenizer, input):
+    """
+    Manually prepends the bos token to the input.
+
+    Args:
+        tokenizer (AutoTokenizer): The tokenizer to use for prepending the bos token.
+        input (Union[str, List[str]]): The input to prepend the bos token to.
+
+    Returns:
+        Union[str, List[str]]: The input with the bos token manually prepended.
+    """
+    if isinstance(input, str):
+        input = tokenizer.bos_token + input
+    else:
+        input = [tokenizer.bos_token + string for string in input]
+    return input
+
+
+def to_tokens(tokenizer, text, max_length, device="cpu"):
+    tokenizer_prepends_bos = len(tokenizer.encode("")) > 0
+    text = text if not tokenizer_prepends_bos else get_input_with_manually_prepended_bos(tokenizer, text)
     tokens = tokenizer(
         text,
         return_tensors="pt",
         padding=True,
         truncation=True,
         max_length=max_length,
-    )["input_ids"].to(device)
-    has_bos_prepended = torch.all(tokens[:, 0] == tokenizer.bos_token_id)
-    if prepend_bos and not has_bos_prepended:
-        tokens = torch.cat(
-            [torch.tensor([tokenizer.bos_token_id]).expand(tokens.shape[0]).unsqueeze(-1).to(device), tokens], dim=1
-        )
-    elif not prepend_bos and has_bos_prepended:
-        tokens = tokens[:, 1:]
-    return tokens
+    )["input_ids"]
+    return tokens.to(device)
 
 
-def set_tokens(tokenizer, bos_token_id, eos_token_id, pad_token_id):
+def set_tokens(tokenizer):
     if tokenizer.eos_token is None:
-        if eos_token_id is None:
-            tokenizer.eos_token = "<|endoftext|>"
-        else:
-            tokenizer.eos_token = tokenizer.decode(eos_token_id)
+        tokenizer.eos_token = "<|endoftext|>"
     if tokenizer.pad_token is None:
-        if pad_token_id is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        else:
-            tokenizer.pad_token = tokenizer.decode(pad_token_id)
+        tokenizer.pad_token = tokenizer.eos_token
     if tokenizer.bos_token is None:
-        if bos_token_id is None:
-            tokenizer.bos_token = tokenizer.eos_token
-        else:
-            tokenizer.bos_token = tokenizer.decode(bos_token_id)
+        tokenizer.bos_token = tokenizer.eos_token
     return tokenizer
 
 
-def _match_str_tokens_to_input(text: str, str_tokens: list[str]) -> list[Optional[dict[str, Any]]]:
+def _match_str_tokens_to_input(text: str, str_tokens: list[str]) -> list[Optional[tuple[int, int]]]:
     """Match the tokens to the input text, returning a list of tuples of the form (start_idx, end_idx) for each token."""
     # Initialize list to store token positions
     token_positions = []
@@ -105,12 +151,8 @@ def _match_str_tokens_to_input(text: str, str_tokens: list[str]) -> list[Optiona
 
     # For each token, try to find its position in the input text
     for token in str_tokens:
-        # Optimization: Check if the token appears immediately at the current position
-        if text.startswith(token, curr_pos):
-            pos = curr_pos
-        else:
-            # Search for token in remaining text
-            pos = text.find(token, curr_pos)
+        # Search for token in remaining text
+        pos = text.find(token, curr_pos)
 
         if pos != -1:
             # Found a match, store position and update curr_pos
@@ -122,84 +164,36 @@ def _match_str_tokens_to_input(text: str, str_tokens: list[str]) -> list[Optiona
             # which cannot be decoded separately.
             # TODO: Deal with subword tokens properly
             if not ((token.startswith("<") and token.endswith(">")) or "�" in token):
-                raise ValueError(f"Token {token} not found in input text `{text}`")
+                raise ValueError(f"Token {token} not found in input text")
             token_positions.append(None)
 
     return token_positions
 
-
 def _get_layer_indices_from_hook_points(hook_points: list[str]) -> list[int]:
-    residual_pattern = r"^blocks\.(\d+)\.hook_resid_post$"
-    matches = [re.match(residual_pattern, hook_point) for hook_point in hook_points]
-    assert all(match is not None for match in matches), "hook_points must be residual stream hook points"
-    layer_indices = [int(cast(re.Match[str], match).group(1)) for match in matches]
-    return layer_indices
+    patterns = [
+        r"^blocks\.(\d+)\.hook_mlp_out$",
+        r"^blocks\.(\d+)\.resid_mid_after_ln$",
+        r"^blocks\.(\d+)\.resid_post_after_ln$",
+        r"^blocks\.(\d+)\.hook_attn_in$",
+        r"^blocks\.(\d+)\.hook_attn_out$",
+    ]
 
-
-class LanguageModelConfig(BaseModelConfig):
-    model_name: str = "gpt2"
-    """ The name of the model to use. """
-    model_from_pretrained_path: str | None = None
-    """ The path to the pretrained model. If `None`, will use the model from HuggingFace. """
-    use_flash_attn: bool = False
-    """ Whether to use Flash Attention. """
-    cache_dir: str | None = None
-    """ The directory of the HuggingFace cache. Should have the same effect as `HF_HOME`. """
-    local_files_only: bool = False
-    """ Whether to only load the model from the local files. Should have the same effect as `HF_HUB_OFFLINE=1`. """
-    max_length: int = 2048
-    """ The maximum length of the input. """
-    backend: Literal["huggingface", "transformer_lens", "auto"] = "auto"
-    """ The backend to use for the language model. """
-    load_ckpt: bool = True
-    tokenizer_only: bool = False
-    """ Whether to only load the tokenizer. """
-    prepend_bos: bool = True
-    """ Whether to prepend the BOS token to the input. """
-    bos_token_id: int | None = None
-    """ The ID of the BOS token. If `None`, will use the default BOS token. """
-    eos_token_id: int | None = None
-    """ The ID of the EOS token. If `None`, will use the default EOS token. """
-    pad_token_id: int | None = None
-    """ The ID of the padding token. If `None`, will use the default padding token. """
-
-    @staticmethod
-    def from_pretrained_sae(pretrained_name_or_path: str, **kwargs):
-        """Load the LanguageModelConfig from a pretrained SAE name or path. Config is read from <pretrained_name_or_path>/lm_config.json (for local storage), <repo_id>/<name>/lm_config.json (for HuggingFace Hub), or constructed from model name (for SAELens).
-
-        Args:
-            pretrained_name_or_path (str): The path to the pretrained SAE.
-            **kwargs (Any): Additional keyword arguments to pass to the LanguageModelConfig constructor.
-        """
-        sae_type = auto_infer_pretrained_sae_type(pretrained_name_or_path.split(":")[0])
-        if sae_type == PretrainedSAEType.LOCAL:
-            path = os.path.join(os.path.dirname(pretrained_name_or_path), "lm_config.json")
-        elif sae_type == PretrainedSAEType.HUGGINGFACE:
-            repo_id, name = pretrained_name_or_path.split(":")
-            path = hf_hub_download(repo_id=repo_id, filename=f"{name}/lm_config.json")
-        elif sae_type == PretrainedSAEType.SAELENS:
-            from sae_lens.loading.pretrained_saes_directory import get_pretrained_saes_directory
-
-            repo_id, name = pretrained_name_or_path.split(":")
-            lookups = get_pretrained_saes_directory()
-            assert lookups.get(repo_id) is not None and lookups[repo_id].saes_map.get(name) is not None, (
-                f"Pretrained SAE {pretrained_name_or_path} not found in SAELens. This might indicate bugs in `auto_infer_pretrained_sae_type`."
+    layer_indices: list[int] = []
+    for hook_point in hook_points:
+        matched = False
+        for pat in patterns:
+            m = re.match(pat, hook_point)
+            if m:
+                layer_indices.append(int(m.group(1)))
+                matched = True
+                break
+        if not matched:
+            raise ValueError(
+                f"hook_point '{hook_point}' must match one of the following formats:"
+                " blocks.<L>.hook_mlp_out | blocks.<L>.resid_mid_after_ln | "
+                "blocks.<L>.resid_post_after_ln | blocks.<L>.hook_attn_in | blocks.<L>.hook_attn_out"
             )
-            model_name = lookups[repo_id].model
-            return LanguageModelConfig(model_name=model_name, **kwargs)
-        else:
-            raise ValueError(f"Unsupported pretrained type: {sae_type}")
-        with open(os.path.join(path, "lm_config.json"), "r") as f:
-            lm_config = json.load(f)
-        return LanguageModelConfig.model_validate(lm_config, **kwargs)
-
-    def save_lm_config(self, sae_path: str):
-        assert os.path.exists(sae_path), f"{sae_path} does not exist. Unable to save LanguageModelConfig."
-
-        d = self.model_dump()
-        with open(os.path.join(sae_path, "lm_config.json"), "w") as f:
-            json.dump(d, f, indent=4)
-
+    return layer_indices
 
 class LanguageModel(ABC):
     @abstractmethod
@@ -260,682 +254,9 @@ class LanguageModel(ABC):
         pass
 
 
-@dataclass(frozen=True)
-class Node:
-    key: Any
-    """Key of the node. Should be a hashable object."""
-
-    indices: torch.Tensor
-    """Indices of elements in the node's data. Should be of shape `(n_elements, d_index)`."""
-
-    offsets: torch.Tensor
-    """In-tensor offsets of elements. Should be of shape `(n_elements,)`."""
-
-    inv_indices: torch.Tensor
-    """Inverse indices of elements. Should be of shape `(n_elements, d_index)`."""
-
-    def __hash__(self) -> int:
-        return hash((self.key, tensor_id(self.indices)))
-
-
-@dataclass
-class NodeInfo:
-    """Node identifier with key and indices into the node's data."""
-
-    key: Any
-    """Key of the node. Should be a hashable object."""
-
-    indices: torch.Tensor
-    """Indices of elements in the node's data. Should be of shape `(n_elements, d_index)`."""
-
-    def __len__(self) -> int:
-        return self.indices.shape[0]
-
-    def __eq__(self, other: object) -> bool:
-        if not isinstance(other, NodeInfo):
-            return False
-        return self.key == other.key and torch.equal(self.indices, other.indices)
-
-    def __getitem__(self, index: slice) -> Self:
-        return replace(self, indices=self.indices[index])
-
-    def split(self, batch_size: int) -> tuple[Self, Self]:
-        return self[:batch_size], self[batch_size:]
-
-
-def compute_inv_indices(indices: torch.Tensor) -> torch.Tensor:
-    inv_indices = torch.empty(
-        [int(indices[:, i].max() + 1) for i in range(indices.shape[1])],
-        device=indices.device,
-        dtype=torch.long,
-    )
-    inv_indices[indices.unbind(dim=1)] = torch.arange(indices.shape[0], device=indices.device)
-    return inv_indices
-
-
-@dataclass
-class Dimension:
-    node_infos: Sequence[NodeInfo]
-    device: torch.device | str
-    mapper: DiscreteMapper
-    node_mappings: dict[Any, Node]
-    offset_mapping: dict[str, torch.Tensor]
-    _nodes_to_offsets_cache: dict[int, torch.Tensor] = field(default_factory=dict)
-
-    @classmethod
-    def empty(cls, device: torch.device | str | None = None) -> Self:
-        return cls(
-            node_infos=[],
-            device=device if device is not None else "cpu",
-            mapper=DiscreteMapper(),
-            node_mappings={},
-            offset_mapping={
-                "keys": torch.tensor([], device=device if device is not None else "cpu", dtype=torch.long),
-                "indices": torch.tensor([], device=device if device is not None else "cpu", dtype=torch.long),
-            },
-        )
-
-    @classmethod
-    def from_node_infos(cls, node_infos: Sequence[NodeInfo]) -> Self:
-        return cls.empty(node_infos[0].indices.device) + node_infos
-
-    def __add__(self, other: Sequence[NodeInfo]) -> Self:
-        node_mappings = dict(self.node_mappings)
-        offset_mapping = dict(self.offset_mapping)
-
-        merged_node_infos = defaultdict(
-            lambda: {
-                "indices": torch.tensor([], device=self.device, dtype=torch.long),
-                "offsets": torch.tensor([], device=self.device, dtype=torch.long),
-            }
-        )
-
-        start = len(self)
-        acc_node_length = 0
-        for node_info in other:
-            node_length = node_info.indices.shape[0]
-            merged_node_infos[node_info.key]["indices"] = torch.cat(
-                [merged_node_infos[node_info.key]["indices"], node_info.indices],
-                dim=0,
-            )
-            merged_node_infos[node_info.key]["offsets"] = torch.cat(
-                [
-                    merged_node_infos[node_info.key]["offsets"],
-                    torch.arange(start + acc_node_length, start + acc_node_length + node_length, device=self.device),
-                ],
-                dim=0,
-            )
-            acc_node_length += node_length
-
-        offset_mapping = {
-            "indices": torch.cat(
-                [offset_mapping["indices"], torch.empty(acc_node_length, device=self.device, dtype=torch.long)],
-                dim=0,
-            ),
-            "keys": torch.cat(
-                [offset_mapping["keys"], torch.empty(acc_node_length, device=self.device, dtype=torch.long)],
-                dim=0,
-            ),
-        }
-
-        for key, node_info in merged_node_infos.items():
-            node_key_id = self.mapper.encode([key])[0]
-
-            # Append node to node mapping
-            if key not in node_mappings:
-                n_original_elements = 0
-                node_mappings = node_mappings | {
-                    key: Node(
-                        key=key,
-                        indices=node_info["indices"],
-                        offsets=node_info["offsets"],
-                        inv_indices=compute_inv_indices(node_info["indices"]),
-                    )
-                }
-            else:
-                n_original_elements = node_mappings[key].indices.shape[0]
-                new_indices = torch.cat(
-                    [node_mappings[key].indices, node_info["indices"]],
-                    dim=0,
-                )
-                node_mappings = node_mappings | {
-                    key: Node(
-                        key=key,
-                        indices=new_indices,
-                        offsets=torch.cat(
-                            [
-                                node_mappings[key].offsets,
-                                node_info["offsets"],
-                            ],
-                            dim=0,
-                        ),
-                        inv_indices=compute_inv_indices(new_indices),
-                    )
-                }
-
-            # Update offset mapping
-            offset_mapping["indices"][node_info["offsets"]] = torch.arange(
-                n_original_elements,
-                n_original_elements + node_info["indices"].shape[0],
-                device=self.device,
-                dtype=torch.long,
-            )
-            offset_mapping["keys"][node_info["offsets"]] = node_key_id
-
-        ret = self.__class__(
-            node_infos=list(self.node_infos) + list(other),
-            device=self.device,
-            mapper=self.mapper,
-            node_mappings=node_mappings,
-            offset_mapping=offset_mapping,
-        )
-        assert len(ret) == len(self) + sum([len(node_info) for node_info in other]), "Dimension length mismatch"
-        return ret
-
-    def __len__(self) -> int:
-        return sum([len(node.indices) for node in self.node_mappings.values()])
-
-    def __hash__(self) -> int:
-        return hash(tuple(self.node_mappings.values()))
-
-    def nodes_to_offsets(self, dimension: Sequence[NodeInfo] | Dimension) -> torch.Tensor:
-        if isinstance(dimension, Dimension):
-            cache_key = hash(dimension)
-            if cache_key in self._nodes_to_offsets_cache:
-                return self._nodes_to_offsets_cache[cache_key]
-
-            offsets = torch.empty(len(dimension), device=self.device, dtype=torch.long)
-            for node in dimension.node_mappings.values():
-                offsets[node.offsets] = self.node_mappings[node.key].offsets[
-                    self.node_mappings[node.key].inv_indices[node.indices.unbind(dim=1)]
-                ]
-
-            self._nodes_to_offsets_cache[cache_key] = offsets
-            return offsets
-        else:
-            offsets = torch.empty(
-                sum([len(node_info) for node_info in dimension]), device=self.device, dtype=torch.long
-            )
-            start = 0
-            for node_info in dimension:
-                offsets[start : start + len(node_info)] = self.node_mappings[node_info.key].offsets[
-                    self.node_mappings[node_info.key].inv_indices[node_info.indices.unbind(dim=1)]
-                ]
-                start += len(node_info)
-            return offsets
-
-    def offsets_to_nodes(self, offsets: torch.Tensor) -> Sequence[NodeInfo]:
-        keys_encoded = self.offset_mapping["keys"][offsets]
-        indices = self.offset_mapping["indices"][offsets]
-        unique_keys_encoded, inverse_indices = torch.unique_consecutive(keys_encoded, return_inverse=True)
-        unique_keys = self.mapper.decode(unique_keys_encoded.tolist())
-        return [
-            NodeInfo(
-                key=unique_keys[i], indices=self.node_mappings[unique_keys[i]].indices[indices[inverse_indices == i]]
-            )
-            for i in range(len(unique_keys))
-        ]
-
-
-class NodeIndexedTensor:
-    def __init__(
-        self,
-        n_dims: int,
-        device: torch.device | str = "cpu",
-        dtype: torch.dtype = torch.float32,
-    ):
-        self.n_dims = n_dims
-        self.data = torch.zeros([0] * self.n_dims, dtype=dtype, device=device)
-        self.dimensions = tuple(Dimension.empty(device=device) for _ in range(self.n_dims))
-
-    @classmethod
-    def from_data(cls, data: torch.Tensor, dimensions: tuple[Sequence[NodeInfo] | Dimension, ...]) -> Self:
-        self = cls.__new__(cls)
-        self.n_dims = data.ndim
-        self.data = data
-        self.dimensions = tuple(
-            dimension
-            if isinstance(dimension, Dimension)
-            else Dimension.from_node_infos(dimension)
-            if len(dimension) > 0
-            else Dimension.empty(device=data.device)
-            for dimension in dimensions
-        )
-        assert all(len(dimension) == data.shape[dim] for dim, dimension in enumerate(self.dimensions)), (
-            "Data length must match dimension length"
-        )
-        return self
-
-    @classmethod
-    def from_dimensions(
-        cls,
-        dimensions: tuple[Sequence[NodeInfo] | Dimension, ...],
-        device: torch.device | str = "cpu",
-        dtype: torch.dtype = torch.float32,
-    ) -> Self:
-        shape = [
-            len(dimension) if isinstance(dimension, Dimension) else sum([len(node_info) for node_info in dimension])
-            for dimension in dimensions
-        ]
-        return cls.from_data(torch.zeros(shape, dtype=dtype, device=device), dimensions)
-
-    def extend(self, node_infos: Sequence[NodeInfo], dim: int, data: torch.Tensor | None = None):
-        new_data_shape = tuple(
-            self.data.shape[i] if i != dim else sum([node_info.indices.shape[0] for node_info in node_infos])
-            for i in range(self.n_dims)
-        )
-
-        if data is None:
-            data = torch.zeros(new_data_shape, dtype=self.data.dtype, device=self.data.device)
-        else:
-            assert data.shape == new_data_shape, (
-                f"Data shape mismatches expected shape: {data.shape} != {new_data_shape}"
-            )
-
-        self.data = torch.cat(
-            [self.data, data],
-            dim=dim,
-        )
-
-        self.dimensions = tuple(
-            self.dimensions[i] + node_infos if i == dim else self.dimensions[i] for i in range(self.n_dims)
-        )
-
-    def __getitem__(
-        self, key: tuple[Sequence[NodeInfo] | Dimension | None, ...] | Sequence[NodeInfo] | Dimension | None
-    ) -> Self:
-        """Index the tensor with NodeInfo selections for each dimension.
-
-        Each dimension accepts a ``Sequence[NodeInfo]`` to select specific node
-        elements, or ``None`` to select all elements along that dimension.
-
-        For a 1-D tensor a single ``Sequence[NodeInfo]`` (or ``None``) can be
-        passed directly; for higher-rank tensors, pass a tuple with one entry
-        per dimension.
-
-        Args:
-            key: Dimension selectors. A tuple of ``(Sequence[NodeInfo] | None)``
-                with length equal to :attr:`n_dims`, or a bare
-                ``Sequence[NodeInfo] | None`` for 1-D tensors.
-
-        Returns:
-            A new :class:`NodeIndexedTensor` (or subclass) containing the
-            selected sub-tensor with updated node mappings.
-        """
-        if not isinstance(key, tuple):
-            key = (key,)
-        key = cast(tuple[Sequence[NodeInfo] | Dimension | None, ...], key)
-        if len(key) != self.n_dims:
-            raise ValueError(f"Expected {self.n_dims} dimension selectors, got {len(key)}")
-
-        data = self.data
-        for dim in range(self.n_dims):
-            dimension = key[dim]
-
-            if dimension is None:
-                continue
-
-            offsets = self.dimensions[dim].nodes_to_offsets(dimension)
-            data = data.index_select(dim, offsets)
-
-        dimensions = tuple(
-            dimension if dimension is not None else self.dimensions[dim] for dim, dimension in enumerate(key)
-        )
-
-        return self.__class__.from_data(data=data, dimensions=dimensions)
-
-    def __setitem__(
-        self,
-        key: tuple[Sequence[NodeInfo] | Dimension | None, ...] | Sequence[NodeInfo] | Dimension | None,
-        value: Self | Tensor,
-    ):
-        """Assign to a NodeInfo-selected sub-tensor.
-
-        Args:
-            key: Dimension selectors. A tuple of ``(Sequence[NodeInfo] | None)``
-                with length equal to :attr:`n_dims`, or a bare
-                ``Sequence[NodeInfo] | None`` for 1-D tensors.
-            value: Tensor values to write to the selected region. When a
-                :class:`NodeIndexedTensor` is provided, its underlying
-                :attr:`data` tensor is assigned.
-
-        Returns:
-            The updated tensor instance.
-        """
-        if not isinstance(key, tuple):
-            key = (key,)
-        key = cast(tuple[Sequence[NodeInfo] | Dimension | None, ...], key)
-        if len(key) != self.n_dims:
-            raise ValueError(f"Expected {self.n_dims} dimension selectors, got {len(key)}")
-
-        value = cast(Tensor, value.data if isinstance(value, NodeIndexedTensor) else value)
-
-        indexers: list[torch.Tensor] = []
-        for dim in range(self.n_dims):
-            dimension = key[dim]
-            offsets = (
-                self.dimensions[dim].nodes_to_offsets(dimension)
-                if dimension is not None
-                else torch.arange(self.data.shape[dim], device=self.data.device, dtype=torch.long)
-            )
-            view_shape = [1] * self.n_dims
-            view_shape[dim] = offsets.shape[0]
-            indexers.append(offsets.view(*view_shape))
-
-        self.data[tuple(indexers)] = value
-        return self
-
-    def __add__(self, other: Self):
-        data = self.data + other.data
-        return self.__class__.from_data(data, self.dimensions)
-
-
-class NodeIndexedVector(NodeIndexedTensor):
-    def __init__(
-        self,
-        device: torch.device | str = "cpu",
-        dtype: torch.dtype = torch.float32,
-    ):
-        super().__init__(
-            n_dims=1,
-            device=device,
-            dtype=dtype,
-        )
-
-    def add_nodes(self, node_infos: Sequence[NodeInfo], data: torch.Tensor | None = None):
-        self.extend(node_infos, 0, data)
-
-    def topk(self, k: int, ignore_node_infos: Sequence[NodeInfo] | None = None):
-        ignore_indices = (
-            self.dimensions[0].nodes_to_offsets(ignore_node_infos)
-            if ignore_node_infos is not None and len(ignore_node_infos) > 0
-            else None
-        )
-        if ignore_indices is not None:
-            self.data[ignore_indices] = float("-inf")
-        topk_values, topk_indices = torch.topk(self.data, k=k, dim=0)
-        return topk_values, self.dimensions[0].offsets_to_nodes(topk_indices)
-
-    @overload
-    def matmul(self, other: NodeIndexedMatrix, _check_node_matching: bool = False) -> NodeIndexedVector: ...
-    @overload
-    def matmul(self, other: NodeIndexedVector, _check_node_matching: bool = False) -> Number: ...
-
-    def matmul(self, other: NodeIndexedMatrix | NodeIndexedVector, _check_node_matching: bool = False):
-        # if _check_node_matching:
-        #     a, b = self.node_infos[0], other.node_infos[0]
-        #     if len(a) != len(b) or any(not ai == bi for ai, bi in zip(a, b)):
-        #         raise ValueError(f"Node matching failed: {a} != {b}")
-
-        data = self.data @ other.data
-
-        if isinstance(other, NodeIndexedMatrix):
-            return NodeIndexedVector.from_data(data, dimensions=(other.dimensions[1],))
-        elif isinstance(other, NodeIndexedVector):
-            return data.item()
-        else:
-            raise ValueError(
-                f"Invalid type as right operand in NodeIndexedVector.matmul: {type(other)}. Expected NodeIndexedMatrix or NodeIndexedVector."
-            )
-
-    def __matmul__(self, other: NodeIndexedMatrix):
-        return self.matmul(other)
-
-
-class NodeIndexedMatrix(NodeIndexedTensor):
-    def __init__(
-        self,
-        device: torch.device | str = "cpu",
-        dtype: torch.dtype = torch.float32,
-    ):
-        super().__init__(
-            n_dims=2,
-            device=device,
-            dtype=dtype,
-        )
-
-    def add_targets(self, node_infos: Sequence[NodeInfo] | NodeInfo, data: torch.Tensor | None = None):
-        node_infos = node_infos if isinstance(node_infos, Sequence) else [node_infos]
-        self.extend(node_infos, 0, data)
-
-    def add_sources(self, node_infos: Sequence[NodeInfo] | NodeInfo, data: torch.Tensor | None = None):
-        node_infos = node_infos if isinstance(node_infos, Sequence) else [node_infos]
-        self.extend(node_infos, 1, data)
-
-    @overload
-    def matmul(self, other: NodeIndexedVector, _check_node_matching: bool = False) -> NodeIndexedVector: ...
-    @overload
-    def matmul(self, other: NodeIndexedMatrix, _check_node_matching: bool = False) -> NodeIndexedMatrix: ...
-
-    def matmul(self, other: NodeIndexedVector | NodeIndexedMatrix, _check_node_matching: bool = False):
-        # if _check_node_matching:
-        #     a, b = self.dimensions[1], other.dimensions[0]
-        #     if len(a) != len(b) or any(not ai == bi for ai, bi in zip(a, b)):
-        #         raise ValueError(f"Node matching failed: {a} != {b}")
-
-        data = self.data @ other.data
-
-        if isinstance(other, NodeIndexedVector):
-            return NodeIndexedVector.from_data(data, dimensions=(self.dimensions[0],))
-        elif isinstance(other, NodeIndexedMatrix):
-            return NodeIndexedMatrix.from_data(data, dimensions=(self.dimensions[0], other.dimensions[1]))
-        else:
-            raise ValueError(f"Invalid type as right operand in NodeIndexedMatrix.matmul: {type(other)}")
-
-    @overload
-    def __matmul__(self, other: NodeIndexedVector) -> NodeIndexedVector: ...
-    @overload
-    def __matmul__(self, other: NodeIndexedMatrix) -> NodeIndexedMatrix: ...
-
-    def __matmul__(self, other: NodeIndexedVector | NodeIndexedMatrix):
-        return self.matmul(other)
-
-
-@dataclass
-class NodeInfoRef(NodeInfo):
-    """NodeInfo with reference to node (tensor) in computation graph."""
-
-    ref: torch.Tensor
-
-
-class NodeInfoQueue[T: NodeInfo]:
-    def __init__(self, node_infos: Sequence[T]):
-        self.queue = list(node_infos)
-
-    def enqueue(self, node_info: Sequence[T]):
-        self.queue.extend(node_info)
-
-    def dequeue(self, batch_size: int) -> Sequence[T]:
-        accumulated = 0
-        results = []
-        while accumulated < batch_size and len(self.queue) > 0:
-            if accumulated + len(self.queue[0]) > batch_size:
-                results.append(self.queue[0][: batch_size - accumulated])
-                self.queue[0] = self.queue[0][batch_size - accumulated :]
-                accumulated = batch_size
-            else:
-                results.append(self.queue.pop(0))
-                accumulated += len(results[-1])
-        return results
-
-    def iter(self, batch_size: int) -> Iterator[Sequence[T]]:
-        while len(self.queue) > 0:
-            yield self.dequeue(batch_size)
-
-
-class NodeInfoSet[T: NodeInfo]:
-    def __init__(self, node_infos: Sequence[T] = []):
-        self.node_dict: dict[Any, T] = {}
-        self.extend(node_infos)
-
-    def extend(self, node_infos: Sequence[T]):
-        for node_info in node_infos:
-            if node_info.key not in self.node_dict:
-                self.node_dict[node_info.key] = replace(node_info)
-            else:
-                self.node_dict[node_info.key].indices = torch.cat(
-                    [self.node_dict[node_info.key].indices, node_info.indices],
-                    dim=0,
-                )
-
-    def __len__(self) -> int:
-        return sum(len(node_info) for node_info in self.node_dict.values())
-
-    def to_list(self) -> list[T]:
-        return list(self.node_dict.values())
-
-
-def get_normalized_matrix(matrix: NodeIndexedMatrix) -> NodeIndexedMatrix:
-    return NodeIndexedMatrix.from_data(
-        data=torch.abs(matrix.data) / torch.abs(matrix.data).sum(dim=1, keepdim=True).clamp(min=1e-8),
-        dimensions=matrix.dimensions,
-    )
-
-
-def compute_intermediates_attribution(
-    attribution: NodeIndexedMatrix,
-    targets: Dimension,
-    intermediates: Dimension,
-    max_iter: int,
-) -> NodeIndexedMatrix:
-    attribution = get_normalized_matrix(attribution)
-    influence = attribution[targets, None]
-    if len(intermediates) == 0:
-        return influence
-    t2i: NodeIndexedMatrix = attribution[targets, intermediates]
-    for _ in range(max_iter):
-        i2i: NodeIndexedMatrix = attribution[intermediates, None]
-        cur_influence = t2i @ i2i
-        if not torch.any(cur_influence.data):
-            break
-        influence += cur_influence
-        t2i = t2i @ attribution[intermediates, intermediates]
-    return influence
-
-
-def greedily_collect_attribution(
-    targets: Sequence[NodeInfoRef],
-    sources: Sequence[NodeInfoRef],
-    intermediates: Sequence[tuple[NodeInfoRef, NodeInfoRef]],  # [up as target, down as source]
-    max_intermediates: int,
-    reduction_weight: torch.Tensor,
-    max_iter: int = 100,
-) -> NodeIndexedMatrix:
-    """
-    Greedily collect attribution from targets to sources through intermediates.
-    """
-
-    all_sources = list(sources) + [intermediate[1] for intermediate in intermediates]
-
-    targets_dimension = Dimension.from_node_infos(targets)
-    all_sources_dimension = Dimension.from_node_infos(all_sources)
-    source_intermediates_dimension = Dimension.from_node_infos([intermediate[1] for intermediate in intermediates])
-    attribution = NodeIndexedMatrix.from_dimensions(
-        dimensions=(targets_dimension, all_sources_dimension),
-        device=targets[0].ref.device,
-        dtype=targets[0].ref.dtype,
-    )
-
-    batch_size = targets[0].ref.shape[0]
-
-    queue = NodeInfoQueue(targets)
-
-    def values(node_infos: Sequence[NodeInfoRef]) -> list[torch.Tensor]:
-        return [node_info.ref[:, *node_info.indices.unbind(dim=1)] for node_info in node_infos]
-
-    def grads(node_infos: Sequence[NodeInfoRef]) -> list[torch.Tensor]:
-        return [
-            node_info.ref.grad[:, *node_info.indices.unbind(dim=1)]
-            if node_info.ref.grad is not None
-            else torch.zeros_like(node_info.ref[:, *node_info.indices.unbind(dim=1)])
-            for node_info in node_infos
-        ]
-
-    def clear_grads(node_infos: Sequence[NodeInfoRef]) -> None:
-        for node_info in node_infos:
-            node_info.ref.grad = None
-
-    for target_batch in queue.iter(batch_size):
-        clear_grads(all_sources)
-        root = torch.diag(torch.cat(values(target_batch), dim=1))
-        root.sum().backward(retain_graph=True)
-        attribution[target_batch, None] = torch.cat(
-            [
-                einops.einsum(
-                    value[: root.shape[0]],
-                    grad[: root.shape[0]],
-                    "batch n_elements ..., batch n_elements ... -> batch n_elements",
-                )
-                for value, grad in zip(values(all_sources), grads(all_sources))
-            ],
-            dim=1,
-        )
-
-    def retrieval_from_intermediates(node_infos: Sequence[NodeInfo]):
-        return [
-            NodeInfoRef(key=node_info.key, indices=node_info.indices, ref=intermediate[0].ref)
-            for node_info in node_infos
-            for intermediate in intermediates
-            if node_info.key == intermediate[0].key
-        ]
-
-    collected_intermediates_dimension = Dimension.empty(device=targets[0].ref.device)
-    reduction_weight: NodeIndexedVector = NodeIndexedVector.from_data(reduction_weight, dimensions=(targets_dimension,))
-    for i in tqdm(range(0, max_intermediates, batch_size)):
-        cur_batch_size = min(batch_size, max_intermediates - i)
-        intermediates_attribution = compute_intermediates_attribution(
-            attribution, targets_dimension, collected_intermediates_dimension, max_iter
-        )
-
-        influence = reduction_weight @ intermediates_attribution[None, source_intermediates_dimension]
-
-        _, selected_node_infos = influence.topk(
-            k=cur_batch_size, ignore_node_infos=collected_intermediates_dimension.node_infos
-        )
-
-        collected_intermediates_dimension = collected_intermediates_dimension + selected_node_infos
-
-        clear_grads(all_sources)
-        node_refs = retrieval_from_intermediates(selected_node_infos)
-        root = torch.diag(torch.cat(values(node_refs), dim=1))
-
-        root.sum().backward(retain_graph=True)
-
-        attribution.add_targets(
-            selected_node_infos,
-            torch.cat(
-                [
-                    einops.einsum(
-                        value[: root.shape[0]],
-                        grad[: root.shape[0]],
-                        "batch n_elements ..., batch n_elements ... -> batch n_elements",
-                    )
-                    for value, grad in zip(values(all_sources), grads(all_sources))
-                ],
-                dim=1,
-            ),
-        )
-
-    return attribution
-
-
-def ln_detach_hooks(models: TransformerLensLanguageModel) -> list[str]:
-
-    assert models.model is not None, "model must be initialized"
-    detach_hooks = []
-    for i, block in enumerate(models.model.blocks):
-        for module_name in ["ln1", "ln2", "ln1_post", "ln2_post"]:
-            if hasattr(block, module_name) and isinstance(getattr(block, module_name), torch.nn.Module):
-                detach_hooks.append(f"blocks.{i}.{module_name}.hook_scale")
-
-    detach_hooks.append("ln_final.hook_scale")
-    return detach_hooks
-
-
 class TransformerLensLanguageModel(LanguageModel):
-    def __init__(self, cfg: LanguageModelConfig, device_mesh: DeviceMesh | None = None):
+    def __init__(self, cfg: LanguageModelConfig):
         self.cfg = cfg
-        self.device_mesh = device_mesh
         if cfg.device == "cuda":
             self.device = torch.device(f"cuda:{torch.cuda.current_device()}")
         elif cfg.device == "npu":
@@ -948,26 +269,20 @@ class TransformerLensLanguageModel(LanguageModel):
                 (cfg.model_name if cfg.model_from_pretrained_path is None else cfg.model_from_pretrained_path),
                 cache_dir=cfg.cache_dir,
                 local_files_only=cfg.local_files_only,
-                dtype=cfg.dtype,
+                torch_dtype=cfg.dtype,
                 trust_remote_code=True,
             )
-            if cfg.load_ckpt and not cfg.tokenizer_only
+            if cfg.load_ckpt
             else None
         )
         hf_tokenizer = AutoTokenizer.from_pretrained(
             (cfg.model_name if cfg.model_from_pretrained_path is None else cfg.model_from_pretrained_path),
-            cache_dir=cfg.cache_dir,
             trust_remote_code=True,
             use_fast=True,
             add_bos_token=True,
             local_files_only=cfg.local_files_only,
         )
-        self.tokenizer = set_tokens(
-            hf_tokenizer,
-            cfg.bos_token_id,
-            cfg.eos_token_id,
-            cfg.pad_token_id,
-        )
+        self.tokenizer = set_tokens(hf_tokenizer)
         self.model = (
             HookedTransformer.from_pretrained_no_processing(
                 cfg.model_name,
@@ -979,142 +294,9 @@ class TransformerLensLanguageModel(LanguageModel):
                 tokenizer=hf_tokenizer,
                 dtype=cfg.dtype,  # type: ignore ; issue with transformer_lens
             )
-            if hf_model and not cfg.tokenizer_only
+            if hf_model
             else None
         )
-
-    def _collect_cache(
-        self,
-        inputs: torch.Tensor | str,
-        replacement_modules: list[SparseDictionary],
-    ):
-        from lm_saes.models.lorsa import LowRankSparseAttention
-        from lm_saes.models.molt import MixtureOfLinearTransform
-        from lm_saes.models.sae import SparseAutoEncoder
-        from lm_saes.models.sparse_dictionary import SparseDictionary
-
-        assert self.model is not None, "model must be initialized"
-        tokens = ensure_tokenized(inputs, self.tokenizer, device=self.device)
-
-        assert all(
-            isinstance(replacement_module, SparseAutoEncoder | LowRankSparseAttention | MixtureOfLinearTransform)
-            for replacement_module in replacement_modules
-        ), (
-            "Currently only support sparse dictionaries that guarantee the hook points in happen before the hook points out."
-        )
-        replacement_modules: list[SparseAutoEncoder | LowRankSparseAttention | MixtureOfLinearTransform] = cast(
-            list[SparseAutoEncoder | LowRankSparseAttention | MixtureOfLinearTransform], replacement_modules
-        )
-
-        with self.apply_saes(cast(list[SparseDictionary], replacement_modules)):
-            with self.detach_at(
-                ["hook_embed"]
-                + [replacement_module.cfg.hook_point_out + ".error" for replacement_module in replacement_modules]
-                + [
-                    replacement_module.cfg.hook_point_out + ".sae.hook_feature_acts"
-                    for replacement_module in replacement_modules
-                ]
-                + [
-                    replacement_module.cfg.hook_point_out + ".sae.hook_attn_pattern"
-                    for replacement_module in replacement_modules
-                    if isinstance(replacement_module, LowRankSparseAttention)
-                ]
-                + [f"blocks.{i}.attn.hook_pattern" for i in range(self.model.cfg.n_layers)]
-                + ln_detach_hooks(self)
-            ):
-                logits, cache = self.run_with_ref_cache(
-                    tokens,
-                    names_filter=["hook_embed.post"]
-                    + [
-                        replacement_module.cfg.hook_point_out + ".error.post"
-                        for replacement_module in replacement_modules
-                    ]
-                    + [
-                        replacement_module.cfg.hook_point_out + ".sae.hook_feature_acts.pre"
-                        for replacement_module in replacement_modules
-                    ]
-                    + [
-                        replacement_module.cfg.hook_point_out + ".sae.hook_feature_acts.post"
-                        for replacement_module in replacement_modules
-                    ],
-                )
-
-        return logits, cache
-
-    def attribute(
-        self,
-        inputs: torch.Tensor | str,
-        replacement_modules: list[SparseDictionary],
-        max_n_logits: int = 10,
-        desired_logit_prob: float = 0.95,
-        batch_size: int = 512,
-        max_features: int | None = None,
-    ):
-        tokens = ensure_tokenized(inputs, self.tokenizer, device=self.device)
-        batch_logits, cache = self._collect_cache(einops.repeat(tokens, "n -> b n", b=batch_size), replacement_modules)
-        replacement_modules: list[SparseAutoEncoder | LowRankSparseAttention | MixtureOfLinearTransform] = cast(
-            list[SparseAutoEncoder | LowRankSparseAttention | MixtureOfLinearTransform], replacement_modules
-        )
-        with torch.no_grad():
-            probs = torch.softmax(batch_logits[0, -1], dim=-1)
-            top_p, top_idx = torch.topk(probs, max_n_logits)
-            cutoff = int(torch.searchsorted(torch.cumsum(top_p, 0), desired_logit_prob)) + 1
-            top_p, top_idx = top_p[:cutoff], top_idx[:cutoff]
-
-        seq_len = cache["hook_embed.post"].shape[1]
-
-        targets: list[NodeInfoRef] = [
-            NodeInfoRef(
-                key="logits",
-                ref=batch_logits[:, -1, :] - batch_logits[:, -1, :].mean(dim=-1, keepdim=True),
-                indices=top_idx.unsqueeze(-1),
-            )
-        ]
-
-        sources: list[NodeInfoRef] = [
-            NodeInfoRef(
-                key="hook_embed",
-                ref=cache["hook_embed.post"],
-                indices=torch.arange(seq_len, device=self.device).unsqueeze(-1),
-            )
-        ] + [
-            NodeInfoRef(
-                key=replacement_module.cfg.hook_point_out + ".error",
-                ref=cache[replacement_module.cfg.hook_point_out + ".error.post"],
-                indices=torch.arange(seq_len, device=self.device).unsqueeze(-1),
-            )
-            for (replacement_module) in replacement_modules
-        ]
-
-        intermediates: list[tuple[NodeInfoRef, NodeInfoRef]] = [
-            (
-                NodeInfoRef(
-                    key=replacement_module.cfg.hook_point_out + ".sae.hook_feature_acts",
-                    ref=cache[replacement_module.cfg.hook_point_out + ".sae.hook_feature_acts.pre"],
-                    indices=cache[replacement_module.cfg.hook_point_out + ".sae.hook_feature_acts.pre"][0].nonzero(),
-                ),
-                NodeInfoRef(
-                    key=replacement_module.cfg.hook_point_out + ".sae.hook_feature_acts",
-                    ref=cache[replacement_module.cfg.hook_point_out + ".sae.hook_feature_acts.post"],
-                    indices=cache[replacement_module.cfg.hook_point_out + ".sae.hook_feature_acts.post"][0].nonzero(),
-                ),
-            )
-            for replacement_module in replacement_modules
-        ]
-
-        max_intermediates = max_features if max_features is not None else len(intermediates)
-        max_iter = len(replacement_modules) + 10
-
-        attribution = greedily_collect_attribution(
-            targets=targets,
-            sources=sources,
-            intermediates=intermediates,
-            max_intermediates=max_intermediates,
-            reduction_weight=top_p,
-            max_iter=max_iter,
-        )
-
-        return attribution
 
     @property
     def eos_token_id(self) -> int | None:
@@ -1131,161 +313,24 @@ class TransformerLensLanguageModel(LanguageModel):
     def preprocess_raw_data(self, raw: dict[str, Any]) -> dict[str, Any]:
         return raw
 
-    def forward(self, *args, **kwargs):
-        assert self.model is not None, "model must be initialized"
-        # Collect all tensor arguments
-        tensors = [arg for arg in args if isinstance(arg, torch.Tensor)] + [
-            v for v in kwargs.values() if isinstance(v, torch.Tensor)
-        ]
-        # Check if all tensors are DTensors
-        is_distributed = len(tensors) > 0 and all(isinstance(t, DTensor) for t in tensors)
-        if self.device_mesh is not None:
-            assert is_distributed, "All tensor inputs must be DTensor when device_mesh is not None"
-            return local_map(
-                self.model.forward,
-                out_placements=DimMap({"data": 0}).placements(self.device_mesh),
-            )(*args, prepend_bos=self.cfg.prepend_bos, **kwargs)  # type: ignore
-        else:
-            assert not is_distributed, "Input should not contain DTensor when device_mesh is None"
-            return self.model.forward(*args, prepend_bos=self.cfg.prepend_bos, **kwargs)
-
-    def __call__(self, *args, **kwargs):
-        return self.forward(*args, **kwargs)
-
-    def _to_tensor(self, input: torch.Tensor) -> torch.Tensor:
-        if isinstance(input, DTensor):
-            assert input.placements == tuple(DimMap({"data": 0}).placements(cast(DeviceMesh, self.device_mesh)))
-            return input.to_local()
-        else:
-            return input
-
-    def _to_dtensor(self, input: torch.Tensor) -> torch.Tensor:
-        return (
-            DTensor.from_local(
-                input,
-                device_mesh=self.device_mesh,
-                placements=DimMap({"data": 0}).placements(cast(DeviceMesh, self.device_mesh)),
-            )
-            if isinstance(input, torch.Tensor)
-            else input
-        )
-
-    def _wrap_hook_for_local(self, hook_fn):
-        def wrapped_hook_fn(*args, **kwargs):
-            args = pytree.tree_map(self._to_dtensor, args)
-            kwargs = pytree.tree_map(self._to_dtensor, kwargs)
-            return pytree.tree_map(self._to_tensor, hook_fn(*args, **kwargs))
-
-        return wrapped_hook_fn
-
-    def run_with_hooks(
-        self,
-        *args,
-        fwd_hooks: list[tuple[Union[str, Callable], Callable]] = [],
-        bwd_hooks: list[tuple[Union[str, Callable], Callable]] = [],
-        **kwargs,
-    ) -> Any:
-        assert self.model is not None, "model must be initialized"
-
-        if self.device_mesh is None:
-            return self.model.run_with_hooks(*args, fwd_hooks=fwd_hooks, bwd_hooks=bwd_hooks, **kwargs)
-
-        wrapped_fwd_hooks = [(name, self._wrap_hook_for_local(hook)) for name, hook in fwd_hooks]
-        wrapped_bwd_hooks = [(name, self._wrap_hook_for_local(hook)) for name, hook in bwd_hooks]
-
-        return self.model.run_with_hooks(*args, fwd_hooks=wrapped_fwd_hooks, bwd_hooks=wrapped_bwd_hooks, **kwargs)
-
-    def run_with_cache(self, *args, **kwargs) -> Any:
-        assert self.model is not None, "model must be initialized"
-        if self.device_mesh is None:
-            return self.model.run_with_cache(*args, **kwargs)
-
-        args = pytree.tree_map(self._to_tensor, args)
-        kwargs = pytree.tree_map(self._to_tensor, kwargs)
-        return pytree.tree_map(self._to_dtensor, self.model.run_with_cache(*args, **kwargs))
-
-    def run_with_cache_until(self, *args, **kwargs) -> Any:
-        """Run with activation caching, stopping at a given hook for efficiency."""
-        assert self.model is not None, "model must be initialized"
-        if self.device_mesh is None:
-            return run_with_cache_until(self.model, *args, **kwargs)
-
-        args = pytree.tree_map(self._to_tensor, args)
-        kwargs = pytree.tree_map(self._to_tensor, kwargs)
-        return pytree.tree_map(self._to_dtensor, run_with_cache_until(self.model, *args, **kwargs))
-
-    @contextmanager
-    def hooks(
-        self,
-        fwd_hooks: list[tuple[Union[str, Callable], Callable]] = [],
-        bwd_hooks: list[tuple[Union[str, Callable], Callable]] = [],
-        reset_hooks_end: bool = True,
-        clear_contexts: bool = False,
-    ):
-        assert self.model is not None, "model must be initialized"
-        wrapped_fwd_hooks = fwd_hooks
-        wrapped_bwd_hooks = bwd_hooks
-        if self.device_mesh is not None:
-            wrapped_fwd_hooks = [(name, self._wrap_hook_for_local(hook)) for name, hook in fwd_hooks]
-            wrapped_bwd_hooks = [(name, self._wrap_hook_for_local(hook)) for name, hook in bwd_hooks]
-
-        with self.model.hooks(
-            fwd_hooks=wrapped_fwd_hooks,
-            bwd_hooks=wrapped_bwd_hooks,
-            reset_hooks_end=reset_hooks_end,
-            clear_contexts=clear_contexts,
-        ):
-            yield self
-
-    @contextmanager
-    def apply_saes(self, saes: list[SparseDictionary]):
-        assert self.model is not None, "model must be initialized"
-        with apply_saes(self.model, saes):
-            yield self
-
-    @contextmanager
-    def detach_at(self, hook_points: list[str]):
-        assert self.model is not None, "model must be initialized"
-        with detach_at(self.model, hook_points):
-            yield self
-
-    def run_with_ref_cache(self, *args, **kwargs) -> Any:
-        assert self.model is not None, "model must be initialized"
-        if self.device_mesh is None:
-            return run_with_ref_cache(self.model, *args, **kwargs)
-
-        args = pytree.tree_map(self._to_tensor, args)
-        kwargs = pytree.tree_map(self._to_tensor, kwargs)
-        return pytree.tree_map(self._to_dtensor, run_with_ref_cache(self.model, *args, **kwargs))
-
     def trace(self, raw: dict[str, Any], n_context: Optional[int] = None) -> list[list[Any]]:
         if any(key in ["images", "videos"] for key in raw):
             warnings.warn(
                 "Tracing with modalities other than text is not implemented for TransformerLensLanguageModel. Only text fields will be used."
             )
-        encoding = self.tokenizer(
-            raw["text"],
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=self.cfg.max_length,
-            return_offsets_mapping=True,
-        )
-        offsets = encoding["offset_mapping"].tolist()
-        tokens = encoding["input_ids"]
-        has_bos_prepended = torch.all(tokens[:, 0] == self.bos_token_id)
-        if self.cfg.prepend_bos and not has_bos_prepended:
-            offsets = [[None] + offset_ for offset_ in offsets]
-        elif not self.cfg.prepend_bos and has_bos_prepended:
-            offsets = [offset_[1:] for offset_ in offsets]
+        tokens = to_tokens(self.tokenizer, raw["text"], max_length=self.cfg.max_length, device=self.cfg.device)
         if n_context is not None:
-            offsets = [offset_[:n_context] for offset_ in offsets]
-            offsets = [offset_ + [None] * (n_context - len(offset_)) for offset_ in offsets]
+            assert self.pad_token_id is not None, (
+                "Pad token ID must be set for TransformerLensLanguageModel when n_context is provided"
+            )
+            tokens = pad_and_truncate_tokens(tokens, n_context, pad_token_id=self.pad_token_id)
+        decoded_str = self.tokenizer.decode(tokens)
+        batch_str_tokens = list(decoded_str)
         return [
-            [{"key": "text", "range": offset} if offset is not None else None for offset in offset_]
-            for offset_ in offsets
+            _match_str_tokens_to_input(text, str_tokens) for (text, str_tokens) in zip(raw["text"], batch_str_tokens)
         ]
 
+    @timer.time("to_activations")
     @torch.no_grad()
     def to_activations(
         self, raw: dict[str, Any], hook_points: list[str], n_context: Optional[int] = None
@@ -1295,122 +340,322 @@ class TransformerLensLanguageModel(LanguageModel):
             warnings.warn(
                 "Activations with modalities other than text is not implemented for TransformerLensLanguageModel. Only text fields will be used."
             )
-        tokens = to_tokens(
-            self.tokenizer,
-            raw["text"],
-            max_length=self.cfg.max_length,
-            device=self.cfg.device,
-            prepend_bos=self.cfg.prepend_bos,
-        )
-        if self.device_mesh is not None and n_context is None:
-            num_token_list = [None for _ in range(dist.get_world_size(group=self.device_mesh.get_group("data")))]
-            dist.all_gather_object(num_token_list, tokens.shape[1], group=self.device_mesh.get_group("data"))
-            n_context = max(cast(list[int], num_token_list))
+        with timer.time("to_tokens"):
+            tokens = self.model.to_tokens(raw["text"], prepend_bos=self.cfg.prepend_bos)
         if n_context is not None:
             assert self.pad_token_id is not None, (
                 "Pad token ID must be set for TransformerLensLanguageModel when n_context is provided"
             )
             tokens = pad_and_truncate_tokens(tokens, n_context, pad_token_id=self.pad_token_id)
-        tokens = tokens.contiguous()
-
-        _, activations = self.run_with_cache_until(tokens, names_filter=hook_points, until=hook_points[-1])
-
-        # we do not want to filter out eos. It might be end of chats and include useful information
-        assert self.pad_token_id is not None and self.bos_token_id is not None, "Pad and BOS token IDs must be set"
-        mask = torch.logical_and(tokens.ne(self.pad_token_id), tokens.ne(self.bos_token_id)).int()
-        attention_mask = torch.logical_and(tokens.ne(self.pad_token_id), tokens.ne(self.bos_token_id)).int()
-
-        return {hook_point: activations[hook_point] for hook_point in hook_points} | {
-            "tokens": tokens,
-            "mask": mask,
-            "attention_mask": attention_mask,
-        }
+        with timer.time("run_with_cache_until"):
+            _, activations = self.model.run_with_cache_until(tokens, names_filter=hook_points)
+        return {hook_point: activations[hook_point] for hook_point in hook_points} | {"tokens": tokens}
 
 
 class HuggingFaceLanguageModel(LanguageModel):
     def __init__(self, cfg: LanguageModelConfig):
         self.cfg = cfg
-        if cfg.device == "cuda":
-            self.device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        elif cfg.device == "npu":
-            self.device = torch.device(f"npu:{torch.npu.current_device()}")  # type: ignore[reportAttributeAccessIssue]
-        else:
-            self.device = torch.device(cfg.device)
-
-        self.model = AutoModelForCausalLM.from_pretrained(
-            cfg.model_name if cfg.model_from_pretrained_path is None else cfg.model_from_pretrained_path,
-            cache_dir=cfg.cache_dir,
-            local_files_only=cfg.local_files_only,
-            dtype=cfg.dtype,
-            trust_remote_code=True,
-        ).to(self.device)  # type: ignore
-
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            cfg.model_name if cfg.model_from_pretrained_path is None else cfg.model_from_pretrained_path,
-            cache_dir=cfg.cache_dir,
-            trust_remote_code=True,
-            use_fast=True,
-            add_bos_token=True,
-            local_files_only=cfg.local_files_only,
+        self.device = (
+            torch.device(f"cuda:{torch.cuda.current_device()}") if cfg.device == "cuda" else torch.device(cfg.device)
         )
-        self.model.eval()
 
     def preprocess_raw_data(self, raw: dict[str, Any]) -> dict[str, Any]:
         return raw
 
+class SearchlessChessBehavioralCloningModel(TransformerLensLanguageModel):
+    def __init__(self, cfg: LanguageModelConfig):
+        self.cfg = cfg
+        
+        self.device = (
+            torch.device(f"cuda:{torch.cuda.current_device()}") if cfg.device == "cuda" else torch.device(cfg.device)
+        )
+        
+        if cfg.model_from_pretrained_path:
+            os.environ["SEARCHLESS_CHESS_PYTORCH_PATH"] = cfg.model_from_pretrained_path
+        
+        print("Loading searchless_chess model using TransformerLens...")
+        self.model = HookedTransformer.from_pretrained_no_processing(
+            'google/searchless-chess-9M-behavioral-cloning',
+            dtype=torch.float32,
+            device=self.device,
+        ).eval()
+        
+        self.tokenizer = SearchlessChessBehavioralCloningTokenizer()
+
     @property
     def eos_token_id(self) -> int | None:
-        return self.tokenizer.eos_token_id
+        return None
 
     @property
     def bos_token_id(self) -> int | None:
-        return self.tokenizer.bos_token_id  # should be None
+        return None
 
     @property
     def pad_token_id(self) -> int | None:
-        return self.tokenizer.pad_token_id
+        return None
+    
+    @torch.no_grad()
+    def preprocess_raw_data(self, raw: dict[str, Any]) -> dict[str, Any]:
+        assert len(raw["fen"]) == len(raw["meta"])
+        
+        texts = []
+        metas = []
+        for i in range(len(raw["fen"])):
+            fen = raw["fen"][i]
+            input = fen
+            texts.append(input)
+            metas.append(raw["meta"][i])
+        
+        preprocessed_data = {"text": texts}
+        preprocessed_data["meta"] = metas
+        
+        return preprocessed_data
+        
+    def trace(self, raw: dict[str, Any], n_context: Optional[int] = None) -> list[list[Any]]:
+        fen = raw["fen"]
+        longfens = []
+        for i in range(len(fen)):
+            fen_i = fen[i]
+            longfen = fen_to_longfen_behavioral_cloning(fen_i)
+            longfens.append(longfen)
+            
+        str_tokens = []
+        for i, longfen in enumerate(longfens):
+            str_token = []
+            for j, char in enumerate(longfen):
+                str_token.append(char)
+            str_tokens.append(str_token)
+        
+        return [
+            _match_str_tokens_to_input(longfen, str_tokens) for (longfen , str_tokens) in zip(longfens, str_tokens)
+        ]
 
+    @torch.no_grad()
     def to_activations(
         self, raw: dict[str, Any], hook_points: list[str], n_context: Optional[int] = None
     ) -> dict[str, torch.Tensor]:
+        assert self.model is not None
         layer_indices = _get_layer_indices_from_hook_points(hook_points)
-        tokens = to_tokens(
-            self.tokenizer,
-            raw["text"],
-            max_length=self.cfg.max_length,
-            device=self.cfg.device,
-            prepend_bos=self.cfg.prepend_bos,
-        )
-        if n_context is not None:
-            assert self.pad_token_id is not None, "Pad token ID must be set when n_context is provided"
-            tokens = pad_and_truncate_tokens(tokens, n_context, pad_token_id=self.pad_token_id)
-        outputs = self.model(tokens, output_hidden_states=True)
-        activations = {
-            hook_points[i]: outputs.hidden_states[layer_index + 1] for i, layer_index in enumerate(layer_indices)
-        }
-        activations["tokens"] = tokens
-        return activations
+        inputs = raw["text"]
+        
+        # Process single input (inputs length is 1)
+        # Convert input to tokens and get model output
+        tokens, _ = self.tokenizer(inputs)
+        log_softmax_output, cache = self.model.run_with_cache_until(tokens, names_filter=hook_points)
 
-    def trace(self, raw: dict[str, Any], n_context: Optional[int] = None) -> list[list[Any]]:
-        encoding = self.tokenizer(
-            raw["text"],
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=self.cfg.max_length,
-            return_offsets_mapping=True,
+        assert isinstance(log_softmax_output, torch.Tensor)
+
+        # Get activations for each hook point and tokens
+        activations = {hook_point: cache[hook_point] for hook_point in hook_points}
+        if isinstance(tokens, list):
+            if isinstance(tokens[0], torch.Tensor):
+                tokens = torch.stack(tokens, dim=0)
+            else:
+                tokens = torch.tensor(tokens)
+        tokens = tokens.to(self.cfg.device)
+        return {hook_point: activations[hook_point] for hook_point in hook_points} | {"tokens": tokens}
+
+
+
+class LeelaChessModel(TransformerLensLanguageModel):
+    def __init__(self, cfg: LanguageModelConfig):
+        self.cfg = cfg
+        
+        self.device = (
+            torch.device(f"cuda:{torch.cuda.current_device()}") if cfg.device == "cuda" else torch.device(cfg.device)
         )
-        offsets = encoding["offset_mapping"]
-        tokens = encoding["input_ids"]
-        has_bos_prepended = torch.all(tokens[:, 0] == self.bos_token_id)
-        if self.cfg.prepend_bos and not has_bos_prepended:
-            offsets = [[None] + offset_ for offset_ in offsets]
-        elif not self.cfg.prepend_bos and has_bos_prepended:
-            offsets = [offset_[1:] for offset_ in offsets]
+
+        if cfg.model_from_pretrained_path:
+            os.environ["LEELA_PYTORCH_PATH"] = cfg.model_from_pretrained_path
+        
+        self.model = HookedTransformer.from_pretrained_no_processing(
+            self.cfg.model_name,
+            dtype=torch.float32,
+            device=self.device,
+        ).eval()
+        
+        self.tokenizer = LeelaBoard()
+        self.embed = LeelaEmbed(self.cfg.d_model)
+        
+    @property
+    def eos_token_id(self) -> int | None:
+        return None
+
+    @property
+    def bos_token_id(self) -> int | None:
+        return None
+
+    @property
+    def pad_token_id(self) -> int | None:
+        return None
+    
+    @torch.no_grad()
+    def preprocess_raw_data(self, raw: dict[str, Any]) -> dict[str, Any]:
+        assert len(raw["fen"]) == len(raw["meta"])
+        texts = []
+        metas = []
+        for i in range(len(raw["fen"])):
+            fen = raw["fen"][i]
+            # move = raw["move"][i]
+            # best_move = raw["best move"][i]
+            # random_move = raw["random move"][i]
+            input = fen
+            # input_random = f"{fen},{random_move}"
+            texts.append(input)
+            metas.append(raw["meta"][i])
+        
+        preprocessed_data = {"text": texts}
+        preprocessed_data["meta"] = metas
+        
+        return preprocessed_data
+        
+    def trace(self, raw: dict[str, Any], n_context: Optional[int] = None) -> list[list[Any]]:
+        fen = raw["fen"]
+        longfens = []
+
+        for i in range(len(fen)):
+            fen_i = fen[i]
+            longfen = fen_to_board_str(fen_i)
+            longfens.append(longfen)
+            
+        str_tokens = []
+        for i, longfen in enumerate(longfens):
+            str_token = []
+            for j, char in enumerate(longfen):
+                str_token.append(char)
+            str_tokens.append(str_token)
+        
+        return [
+            _match_str_tokens_to_input(longfen, str_tokens) for (longfen , str_tokens) in zip(longfens, str_tokens)
+        ]
+
+    @torch.no_grad()
+    def to_activations(
+        self, raw: dict[str, Any], hook_points: list[str], n_context: Optional[int] = None
+    ) -> dict[str, torch.Tensor]:
+        assert self.model is not None
+        layer_indices = _get_layer_indices_from_hook_points(hook_points)
+        inputs = raw["text"]
+
+
+        embeds = []
+        for input in inputs:
+            token = self.tokenizer(input)
+            embed = self.embed(token)
+            embed = embed.squeeze(0)
+            embeds.append(embed)
+        outputs, cache = self.model.run_with_cache_until(inputs, names_filter=hook_points)
+        logits = outputs[0]
+        assert isinstance(logits, torch.Tensor)
+
+        activations = {hook_point: cache[hook_point] for hook_point in hook_points}
+        if isinstance(embeds, list):
+            if isinstance(embeds[0], torch.Tensor):
+                embeds = torch.stack(embeds, dim=0)
+            else:
+                embeds = torch.tensor(embeds)
+        batch_size, seq_len = embeds.shape[:2]
+        dummy_tokens = torch.ones(batch_size, seq_len, dtype=torch.long, device=self.cfg.device)
+
+        # Return the activations and tokens
+        return {hook_point: activations[hook_point] for hook_point in hook_points} | {"tokens": dummy_tokens}
+
+
+
+class LLaDALanguageModel(TransformerLensLanguageModel):
+    cfg: LLaDAConfig  # Explicitly specify the type to avoid linter errors
+
+    @property
+    def mdm_mask_token_id(self) -> int:
+        return self.cfg.mdm_mask_token_id
+
+    @torch.no_grad()
+    def _get_masked_tokens(self, tokens: torch.Tensor, pad_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Apply random masking to non-pad tokens based on mask_ratio. The random seed should be determined by the raw data.
+        Args:
+            tokens (torch.Tensor): The tokens to mask.
+            pad_mask (torch.Tensor): The mask of the padding tokens.
+
+        Returns:
+            torch.Tensor: The tokens after masking. Pad tokens are included.
+        """
+        if self.cfg.mask_ratio <= 0:
+            return tokens
+
+        # Calculate random seeds based on non-pad tokens
+        random_seeds = (tokens * ~pad_mask).sum(dim=1).tolist()
+        masked_tokens = tokens.clone()
+
+        # For each sequence in the batch
+        for i, seed in enumerate(random_seeds):
+            # Create random generator with deterministic seed
+            random_generator = torch.Generator(device=tokens.device)
+            random_generator.manual_seed(seed)
+
+            # Generate random values for all positions
+            random_values = torch.rand(tokens[i].shape, device=tokens[i].device, generator=random_generator)
+
+            # Count non-pad tokens
+            non_pad_mask = ~pad_mask[i]
+            non_pad_count = non_pad_mask.sum()
+
+            # Calculate number of tokens to mask
+            num_to_mask = int(non_pad_count.item() * self.cfg.mask_ratio)
+            if num_to_mask == 0:
+                continue
+
+            # Set random values for pad positions to infinity so they won't be selected
+            random_values = torch.where(non_pad_mask, random_values, torch.full_like(random_values, float("inf")))
+
+            # Get indices of positions to mask (lowest random values)
+            mask_indices = torch.topk(random_values, k=num_to_mask, largest=False).indices
+
+            # Apply masking
+            masked_tokens[i][mask_indices] = self.mdm_mask_token_id
+
+        return masked_tokens
+
+    @torch.no_grad()
+    def preprocess_raw_data(self, raw: dict[str, Any]) -> dict[str, Any]:
+        assert self.model is not None
+        tokens = self.model.to_tokens(raw["text"], prepend_bos=self.cfg.prepend_bos)
+        pad_mask = tokens == self.pad_token_id
+        masked_tokens = self._get_masked_tokens(tokens, pad_mask)
+        raw["text"] = self.tokenizer.batch_decode(masked_tokens)
+        pad_token = self.tokenizer.pad_token
+        raw["text"] = [text.replace(pad_token, "") for text in raw["text"]]
+        raw_meta = raw.get("meta", [])
+        raw["meta"] = [
+            (raw_meta[i] if i < len(raw_meta) else {}) | {"mask_ratio": self.cfg.mask_ratio}
+            for i in range(len(raw["text"]))
+        ]
+        return raw
+
+    @torch.no_grad()
+    def to_activations(
+        self, raw: dict[str, Any], hook_points: list[str], n_context: Optional[int] = None
+    ) -> dict[str, torch.Tensor]:
+        assert self.model is not None
+        tokens = self.model.to_tokens(raw["text"], prepend_bos=self.cfg.prepend_bos)
         if n_context is not None:
-            offsets = [offset_[:n_context] for offset_ in offsets]
-            offsets = [offset_ + [None] * (n_context - len(offset_)) for offset_ in offsets]
-        return [[{"key": "text", "range": offset} for offset in offset_] for offset_ in offsets]
+            assert self.pad_token_id is not None, (
+                "Pad token ID must be set for LLaDALanguageModel when n_context is provided"
+            )
+            tokens = pad_and_truncate_tokens(tokens, n_context, pad_token_id=self.pad_token_id)
+        pad_mask = tokens == self.pad_token_id
+        predicted_tokens = None
+        if self.cfg.calculate_logits:
+            logits, activations = self.model.run_with_cache(tokens, names_filter=hook_points)
+            assert isinstance(logits, torch.Tensor)
+            predicted_token_ids = logits.argmax(dim=-1)
+            predicted_tokens = torch.where(pad_mask, -1, predicted_token_ids)
+        else:
+            _, activations = self.model.run_with_cache_until(tokens, names_filter=hook_points)
+        predicted_tokens = {"predicted_tokens": predicted_tokens} if predicted_tokens is not None else {}
+        return (
+            {hook_point: activations[hook_point] for hook_point in hook_points} | {"tokens": tokens} | predicted_tokens
+        )
 
 
 class QwenVLLanguageModel(HuggingFaceLanguageModel):
@@ -1420,7 +665,7 @@ class QwenVLLanguageModel(HuggingFaceLanguageModel):
             cfg.model_name,
             cache_dir=cfg.cache_dir,
             local_files_only=cfg.local_files_only,
-            dtype=cfg.dtype,
+            torch_dtype=cfg.dtype,
             attn_implementation="flash_attention_2" if cfg.use_flash_attn else None,
         ).to(self.device)  # type: ignore
 
@@ -1575,3 +820,76 @@ class QwenVLLanguageModel(HuggingFaceLanguageModel):
         )
 
         return inputs, processed_raw
+
+
+class QwenLanguageModel(HuggingFaceLanguageModel):
+    def __init__(self, cfg: LanguageModelConfig):
+        super().__init__(cfg)
+        # hidden_size is 3584 for Qwen2.5-7B
+        self.model = AutoModelForCausalLM.from_pretrained(
+            cfg.model_name,
+            cache_dir=cfg.cache_dir,
+            local_files_only=cfg.local_files_only,
+            torch_dtype=cfg.dtype,
+        ).to(self.device)  # type: ignore
+
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            cfg.model_name,
+            cache_dir=cfg.cache_dir,
+            local_files_only=cfg.local_files_only,
+            padding_side="left",
+        )
+        self.model.eval()
+
+    @property
+    def eos_token_id(self) -> int | None:
+        return self.tokenizer.eos_token_id
+
+    @property
+    def bos_token_id(self) -> int | None:
+        return self.tokenizer.bos_token_id  # should be None
+
+    @property
+    def pad_token_id(self) -> int | None:
+        return self.tokenizer.pad_token_id
+
+    def to_activations(
+        self, raw: dict[str, Any], hook_points: list[str], n_context: Optional[int] = None
+    ) -> dict[str, torch.Tensor]:
+        layer_indices = _get_layer_indices_from_hook_points(hook_points)
+        inputs = self.tokenizer(
+            raw["text"],
+            return_tensors="pt",
+            padding="max_length",
+            max_length=self.cfg.max_length,
+            truncation=True,
+        ).to(self.device)
+        if n_context is not None:
+            assert self.pad_token_id is not None, (
+                "Pad token ID must be set for QwenLanguageModel when n_context is provided"
+            )
+            inputs["input_ids"] = pad_and_truncate_tokens(
+                inputs["input_ids"], n_context, pad_token_id=self.pad_token_id
+            )
+        outputs = self.model(**inputs, output_hidden_states=True)
+        activations = {
+            hook_points[i]: outputs.hidden_states[layer_index + 1] for i, layer_index in enumerate(layer_indices)
+        }
+        activations["tokens"] = inputs["input_ids"]
+        return activations
+
+    def trace(self, raw: dict[str, Any], n_context: Optional[int] = None) -> list[list[Any]]:
+        inputs = self.tokenizer(
+            raw["text"], return_tensors="pt", padding="max_length", max_length=self.cfg.max_length, truncation=True
+        )
+        input_ids = inputs["input_ids"]
+        if n_context is not None:
+            assert self.pad_token_id is not None, (
+                "Pad token ID must be set for QwenLanguageModel when n_context is provided"
+            )
+            input_ids = pad_and_truncate_tokens(input_ids, n_context, pad_token_id=self.pad_token_id)
+        decoded_str = self.tokenizer.decode(input_ids)
+        batch_str_tokens = list(decoded_str)
+        return [
+            _match_str_tokens_to_input(text, str_tokens) for (text, str_tokens) in zip(raw["text"], batch_str_tokens)
+        ]

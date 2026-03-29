@@ -13,11 +13,10 @@ from torch.distributed.tensor import DTensor
 from torch.utils.data import DataLoader, Dataset, Sampler
 from tqdm import tqdm
 
+from lm_saes.activation.processors.core import BaseActivationProcessor
 from lm_saes.utils.distributed import DimMap, all_gather_dict, mesh_dim_rank, mesh_dim_size
 from lm_saes.utils.misc import is_master
 from lm_saes.utils.tensor_dict import move_dict_of_tensor_to_device
-
-from .core import BaseActivationProcessor
 
 
 class DistributedSampler(Sampler[Any]):
@@ -38,13 +37,11 @@ class DistributedSampler(Sampler[Any]):
 
         dp_size = mesh_dim_size(self.device_mesh, "data")
         tp_size = mesh_dim_size(self.device_mesh, "model")
-        sweep_size = mesh_dim_size(self.device_mesh, "sweep")
-        non_dp_size = tp_size * sweep_size
 
         # Min chunk unit is decided by how many iterations are required to collect exact all hook points of some chunks in tensor parallel.
-        min_chunk_unit = dp_size * non_dp_size // math.gcd(n_hook_points, non_dp_size)
+        min_chunk_unit = dp_size * tp_size // math.gcd(n_hook_points, tp_size)
         n_samples_total = n_chunks // min_chunk_unit * min_chunk_unit * n_hook_points
-        n_samples_local = n_samples_total // dp_size // non_dp_size
+        n_samples_local = n_samples_total // dp_size // tp_size
         return n_samples_local
 
     def __iter__(self) -> Iterator[Any]:
@@ -53,24 +50,18 @@ class DistributedSampler(Sampler[Any]):
 
         dp_size = mesh_dim_size(self.device_mesh, "data")
         tp_size = mesh_dim_size(self.device_mesh, "model")
-        sweep_size = mesh_dim_size(self.device_mesh, "sweep")
 
-        non_dp_size = tp_size * sweep_size
-        min_chunk_unit = dp_size * non_dp_size // math.gcd(n_hook_points, non_dp_size)
+        min_chunk_unit = dp_size * tp_size // math.gcd(n_hook_points, tp_size)
         n_chunks_effective = n_chunks // min_chunk_unit * min_chunk_unit
-
         # First assign chunks based on data groups to ensure each data group own self-contained chunks.
         chunks = list(self.chunk_to_index.keys())[
             mesh_dim_rank(self.device_mesh, "data") : n_chunks_effective : dp_size
         ]
 
-        # In the local dp group: concat all chunks and flatten all hook point indices
-        all_indices = list(itertools.chain.from_iterable([list(self.chunk_to_index[k].values()) for k in chunks]))
-        model_rank = mesh_dim_rank(self.device_mesh, "model")
-        sweep_rank = mesh_dim_rank(self.device_mesh, "sweep")
-        combined_rank = model_rank * sweep_size + sweep_rank
-
-        indices = all_indices[combined_rank::non_dp_size]
+        # In the local dp group: concat all chunks and assign chunks to model groups.
+        indices = list(itertools.chain.from_iterable([list(self.chunk_to_index[k].values()) for k in chunks]))[
+            mesh_dim_rank(self.device_mesh, "model") :: tp_size
+        ]
 
         assert len(indices) == self.n_samples, f"len(indices) {len(indices)} != self.n_samples {self.n_samples}"
 
@@ -183,14 +174,10 @@ class CachedActivationLoader(BaseActivationProcessor[None, Iterable[dict[str, An
         assert isinstance(data, dict), f"Loading cached activation {chunk.path} error: returned {type(data)}"
         assert "activation" in data, f"Loading cached activation {chunk.path} error: missing 'activation' field"
         assert "tokens" in data, f"Loading cached activation {chunk.path} error: missing 'tokens' field"
-        assert "mask" in data, f"Loading cached activation {chunk.path} error: missing 'mask' field"
-        assert "attention_mask" in data, f"Loading cached activation {chunk.path} error: missing 'attention_mask' field"
 
         return {
             "hook_point": hook_point,
             "activation": data["activation"],
-            "mask": data["mask"],
-            "attention_mask": data["attention_mask"],
             "tokens": data["tokens"],
             "meta": data.get("meta"),
             "chunk_idx": chunk_idx,
@@ -308,14 +295,7 @@ class CachedActivationLoader(BaseActivationProcessor[None, Iterable[dict[str, An
             data = move_dict_of_tensor_to_device(data, device=self.device)
             if self.device_mesh is not None:
                 gathered = all_gather_dict(data, group=self.device_mesh.get_group("model"))
-                if mesh_dim_size(self.device_mesh, "sweep") > 1:
-                    yield from (
-                        sweep_item
-                        for item in gathered
-                        for sweep_item in all_gather_dict(item, group=self.device_mesh.get_group("sweep"))
-                    )
-                else:
-                    yield from gathered
+                yield from gathered
             else:
                 yield data
 
@@ -364,8 +344,6 @@ class CachedActivationLoader(BaseActivationProcessor[None, Iterable[dict[str, An
             if chunk_idx not in chunk_buffer:
                 chunk_buffer[chunk_idx] = {
                     "tokens": single_hook_data["tokens"],
-                    "mask": single_hook_data["mask"],
-                    "attention_mask": single_hook_data["attention_mask"],
                     "meta": single_hook_data["meta"],
                 }
 
@@ -377,8 +355,7 @@ class CachedActivationLoader(BaseActivationProcessor[None, Iterable[dict[str, An
                 raise AssertionError(f"Loading cached activation error: tokens mismatch for chunk {chunk_idx}")
 
             # Check if we have all hook points for this chunk
-            # -4 stands for initial tokens, meta, token_mask and attention_mask
-            if len(chunk_buffer[chunk_idx]) - 4 == len(self.cache_dirs):
+            if len(chunk_buffer[chunk_idx]) - 2 == len(self.cache_dirs):  # -2 for tokens and meta
                 activations = chunk_buffer.pop(chunk_idx)
                 if self.dtype is not None:
                     for k, v in activations.items():

@@ -1,35 +1,33 @@
 import os
 import warnings
-from typing import Iterable, Union, cast
+from typing import Any, Iterable, Optional, Union, cast
 
 import torch
 import torch.distributed as dist
 from jaxtyping import Float
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.nn.functional import all_reduce
 
-from .distributed import DimMap
-from .distributed.ops import item
+from lm_saes.utils.distributed import DimMap
+
 from .logging import get_distributed_logger
 
 logger = get_distributed_logger("utils.misc")
 
 
-def tensor_id(t: torch.Tensor) -> tuple[int, int, tuple[int, ...], tuple[int, ...]]:
-    """Return a hashable tuple describing a tensor's storage view.
-
-    Combines the first element's ``data_ptr()``, ``storage_offset()``, ``shape``,
-    and ``stride`` so distinct views into the same buffer are distinguished.
-    """
-    return (
-        t.data_ptr(),
-        int(t.storage_offset()),
-        tuple(t.shape),
-        tuple(t.stride()),
-    )
-
-
 def is_master() -> bool:
     return not dist.is_initialized() or dist.get_rank() == 0
+
+
+def is_primary_rank(device_mesh: DeviceMesh | None, dim_name: str = "sweep") -> bool:
+    if device_mesh is None:
+        return True
+    coord = device_mesh.get_coordinate()
+    mesh_dim_names = device_mesh.mesh_dim_names
+    if coord is None or mesh_dim_names is None:
+        return False
+    coord = [c for i, c in enumerate(coord) if dim_name not in mesh_dim_names or i != mesh_dim_names.index(dim_name)]
+    return all(c == 0 for c in coord)
 
 
 def print_once(
@@ -103,6 +101,42 @@ def convert_torch_dtype_to_str(dtype: torch.dtype) -> str:
         raise ValueError(f"Unsupported data type: {dtype}. Supported data types: {list(dtype_str_map.values())}.")
 
 
+def all_gather_tensor(tensor, group: Optional[torch.distributed.ProcessGroup] = None):
+    world_size = dist.get_world_size(group=group)
+    tensor_meta = {"shape": tensor.shape, "dtype": tensor.dtype}
+    meta_list: list[dict[str, Any] | None] = [None for _ in range(world_size)]
+    dist.all_gather_object(meta_list, tensor_meta, group=group)
+    gathered_tensors = [
+        torch.empty(rank_meta["shape"], dtype=rank_meta["dtype"], device=tensor.device)
+        for rank_meta in cast(list[dict[str, Any]], meta_list)
+    ]
+    dist.all_gather(gathered_tensors, tensor, group=group)
+    return gathered_tensors
+
+
+def get_tensor_from_specific_rank(tensor, src=0):
+    dist.broadcast(tensor, src=src)
+    return tensor
+
+
+def all_reduce_tensor(tensor, aggregate: str, group: Optional[torch.distributed.ProcessGroup] = None):
+    _OP_MAP = {
+        "sum": dist.ReduceOp.SUM,
+        "mean": dist.ReduceOp.SUM,  # Use SUM for mean, but will need to divide by world size
+        "min": dist.ReduceOp.MIN,
+        "max": dist.ReduceOp.MAX,
+        "product": dist.ReduceOp.PRODUCT,
+    }
+    assert aggregate in _OP_MAP, f"Unsupported aggregate: {aggregate}. Supported aggregates: {list(_OP_MAP.keys())}."
+
+    # gathered_tensors = [torch.zeros_like(tensor) for _ in range(world_size)]
+    tensor = all_reduce(tensor, op=_OP_MAP[aggregate])
+    assert tensor is not None, "All reduce failed"
+    if aggregate == "mean":
+        tensor = tensor / dist.get_world_size(group=group)
+    return tensor
+
+
 def assert_tensor_consistency(tensor):
     flat_tensor = tensor.flatten()
 
@@ -150,7 +184,7 @@ def calculate_activation_norm(
                 activation_norm[key] = torch.cat((activation_norm[key], batch[key].norm(p=2, dim=-1)), dim=0)
         batch_num -= 1
     for key in activation_norm:
-        activation_norm[key] = item(activation_norm[key].mean())
+        activation_norm[key] = activation_norm[key].mean().item()
     if device_mesh is not None and "head" in cast(tuple[str, ...], device_mesh.mesh_dim_names):
         object_list = [None] * device_mesh.get_group("head").size()
         dist.all_gather_object(object_list, activation_norm, group=device_mesh.get_group("head"))
@@ -191,17 +225,3 @@ def get_slice_length(s: slice, length: int):
     start, stop, step = s.indices(length)
     length = (stop - start + step - 1) // step
     return length
-
-
-def ensure_tokenized(
-    prompt: str | torch.Tensor | list[int], tokenizer, device: torch.device | str = "cpu"
-) -> torch.Tensor:
-    """Convert *prompt* → 1-D tensor of token ids (no batch dim)."""
-
-    if isinstance(prompt, str):
-        return tokenizer(prompt, return_tensors="pt").input_ids[0].to(device)
-    if isinstance(prompt, torch.Tensor):
-        return prompt.squeeze(0).to(device) if prompt.ndim == 2 else prompt.to(device)
-    if isinstance(prompt, list):
-        return torch.tensor(prompt, dtype=torch.long, device=device)
-    raise TypeError(f"Unsupported prompt type: {type(prompt)}")

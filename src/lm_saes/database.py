@@ -1,27 +1,23 @@
-import os
 from datetime import datetime
-from typing import Annotated, Any, Literal, Optional, Union
+from typing import Any, Optional
 
 import gridfs
 import numpy as np
 import pymongo
 import pymongo.database
 import pymongo.errors
-import pymongo.results
 from bson import ObjectId
-from pydantic import BaseModel, Field
-from tqdm import tqdm
+from pydantic import BaseModel
 
-from lm_saes.backend.language_model import LanguageModelConfig
-from lm_saes.config import DatasetConfig
-from lm_saes.models.sae import SAEConfig
-from lm_saes.models.sparse_dictionary import SparseDictionaryConfig
-from lm_saes.utils.bytes import bytes_to_np, np_to_bytes
+from lm_saes.config import (
+    BaseSAEConfig,
+    DatasetConfig,
+    LanguageModelConfig,
+    MongoDBConfig,
+    SAEConfig,
+)
 
-
-class MongoDBConfig(BaseModel):
-    mongo_uri: str = Field(default_factory=lambda: os.environ.get("MONGO_URI", "mongodb://localhost:27017/"))
-    mongo_db: str = Field(default_factory=lambda: os.environ.get("MONGO_DB", "mechinterp"))
+from .utils.bytes import bytes_to_np, np_to_bytes
 
 
 class DatasetRecord(BaseModel):
@@ -54,7 +50,7 @@ class FeatureAnalysis(BaseModel):
     n_analyzed_tokens: Optional[int] = None
     act_times_modalities: Optional[dict[str, float]] = None
     max_feature_acts_modalities: Optional[dict[str, float]] = None
-    samplings: list[FeatureAnalysisSampling] = []
+    samplings: list[FeatureAnalysisSampling]
 
 
 class FeatureRecord(BaseModel):
@@ -85,12 +81,6 @@ class SAERecord(BaseModel):
     cfg: SAEConfig  # TODO: add more variants of SAEConfig
 
 
-class SAESetRecord(BaseModel):
-    name: str
-    sae_series: str
-    sae_names: list[str]
-
-
 class BookmarkRecord(BaseModel):
     """Record for bookmarked features.
 
@@ -111,81 +101,40 @@ class BookmarkRecord(BaseModel):
     notes: Optional[str] = None
 
 
-class CircuitStatus(str):
-    """Status of circuit generation."""
+class CircuitAnnotationRecord(BaseModel):
+    """Record for circuit annotations.
 
-    PENDING = "pending"
-    RUNNING = "running"
-    COMPLETED = "completed"
-    FAILED = "failed"
-
-
-class CircuitConfig(BaseModel):
-    """Configuration used to generate a circuit graph.
-
-    Note: node_threshold and edge_threshold are no longer stored here.
-    They are now query-time parameters for dynamic pruning.
+    Attributes:
+        circuit_id: Unique identifier for the circuit annotation
+        circuit_interpretation: Interpretation text for the entire circuit
+        sae_combo_id: SAE combination ID associated with this circuit
+        features: List of features in the circuit, each containing:
+            - sae_name: Name of the SAE
+            - sae_series: Series of the SAE
+            - layer: Layer number (actual layer in the model)
+            - feature_index: Index of the feature
+            - feature_type: Type of feature ("transcoder" or "lorsa")
+            - interpretation: Interpretation text for this feature
+            - level: Optional circuit level (independent of layer, for visualization)
+            - feature_id: Optional unique identifier for this feature in the circuit
+        edges: List of edges between features, each containing:
+            - source_feature_id: ID of the source feature
+            - target_feature_id: ID of the target feature
+            - weight: Weight of the edge
+            - interpretation: Optional interpretation text for this edge
+        created_at: Timestamp when the circuit annotation was created
+        updated_at: Timestamp when the circuit annotation was last updated
+        metadata: Optional metadata dictionary for additional information
     """
 
-    desired_logit_prob: float = 0.98
-    max_feature_nodes: int = 256
-    qk_tracing_topk: int = 10
-    max_n_logits: int = 1
-    list_of_features: Optional[list[tuple[int, int, int, bool]]] = None
-
-
-class CircuitTextInput(BaseModel):
-    input_type: Literal["plain_text"] = "plain_text"
-    text: str
-
-
-class CircuitChatTemplateInput(BaseModel):
-    input_type: Literal["chat_template"] = "chat_template"
-    messages: list[dict[str, str]]
-
-
-CircuitInput = Annotated[Union[CircuitTextInput, CircuitChatTemplateInput], Field(discriminator="input_type")]
-
-
-class CircuitRecord(BaseModel):
-    """Record for a generated circuit graph."""
-
-    id: str
-    name: Optional[str] = None
-    """Optional custom name/ID for the circuit."""
-    group: Optional[str] = None
-    """Optional group name for the circuit."""
-    sae_set_name: str
-    sae_series: str
-    prompt: str
-    """The prompt used to generate the circuit."""
-    input: CircuitInput
-    config: CircuitConfig
+    circuit_id: str
+    circuit_interpretation: str
+    sae_combo_id: str
+    features: list[dict[str, Any]]
+    edges: list[dict[str, Any]] = []
     created_at: datetime
-    parent_id: Optional[str] = None
-    """Optional ID of the parent circuit."""
-
-    # Status tracking fields
-    status: str = CircuitStatus.PENDING
-    """Current status of circuit generation."""
-    progress: float = 0.0
-    """Progress percentage (0-100)."""
-    progress_phase: Optional[str] = None
-    """Current phase description (e.g., 'Computing attribution 50/200')."""
-    error_message: Optional[str] = None
-    """Error message if status is 'failed'."""
-
-    # Raw graph storage (replaces graph_data)
-    raw_graph_id: Optional[str] = None
-    """GridFS ObjectId for the raw Graph object."""
-
-    # CLT and LORSA names needed for serialization
-    clt_names: Optional[list[str]] = None
-    """Names of the CLT SAEs used in this circuit."""
-    lorsa_names: Optional[list[str]] = None
-    """Names of the LORSA SAEs used in this circuit."""
-    use_lorsa: bool = True
-    """Whether LORSA was used in this circuit."""
+    updated_at: datetime
+    metadata: Optional[dict[str, Any]] = None
 
 
 class MongoClient:
@@ -199,8 +148,7 @@ class MongoClient:
         self.dataset_collection = self.db["datasets"]
         self.model_collection = self.db["models"]
         self.bookmark_collection = self.db["bookmarks"]
-        self.sae_set_collection = self.db["sae_sets"]
-        self.circuit_collection = self.db["circuits"]
+        self.circuit_annotations_collection = self.db["circuit_annotations"]
         self.sae_collection.create_index([("name", pymongo.ASCENDING), ("series", pymongo.ASCENDING)], unique=True)
         self.sae_collection.create_index([("series", pymongo.ASCENDING)])
         self.analysis_collection.create_index(
@@ -213,15 +161,23 @@ class MongoClient:
         )
         self.dataset_collection.create_index([("name", pymongo.ASCENDING)], unique=True)
         self.model_collection.create_index([("name", pymongo.ASCENDING)], unique=True)
-        self.sae_set_collection.create_index([("name", pymongo.ASCENDING)], unique=True)
-        self.sae_set_collection.create_index([("sae_series", pymongo.ASCENDING)])
         self.bookmark_collection.create_index(
             [("sae_name", pymongo.ASCENDING), ("sae_series", pymongo.ASCENDING), ("feature_index", pymongo.ASCENDING)],
             unique=True,
         )
         self.bookmark_collection.create_index([("created_at", pymongo.DESCENDING)])
-        self.circuit_collection.create_index([("sae_series", pymongo.ASCENDING)])
-        self.circuit_collection.create_index([("created_at", pymongo.DESCENDING)])
+        # Circuit annotations indexes
+        self.circuit_annotations_collection.create_index([("circuit_id", pymongo.ASCENDING)], unique=True)
+        self.circuit_annotations_collection.create_index([("sae_combo_id", pymongo.ASCENDING)])
+        self.circuit_annotations_collection.create_index(
+            [
+                ("features.sae_name", pymongo.ASCENDING),
+                ("features.layer", pymongo.ASCENDING),
+                ("features.feature_index", pymongo.ASCENDING),
+            ]
+        )
+        self.circuit_annotations_collection.create_index([("created_at", pymongo.DESCENDING)])
+        self.circuit_annotations_collection.create_index([("updated_at", pymongo.DESCENDING)])
 
         # Initialize GridFS by default
         self._init_fs()
@@ -283,9 +239,9 @@ class MongoClient:
         if isinstance(data, ObjectId) and self.fs.exists(data):
             self.fs.delete(data)
 
-    def create_sae(self, name: str, series: str, path: str, cfg: SparseDictionaryConfig, model_name: str | None = None):
+    def create_sae(self, name: str, series: str, path: str, cfg: BaseSAEConfig):
         inserted_id = self.sae_collection.insert_one(
-            {"name": name, "series": series, "path": path, "cfg": cfg.model_dump(), "model_name": model_name}
+            {"name": name, "series": series, "path": path, "cfg": cfg.model_dump()}
         ).inserted_id
         self.feature_collection.insert_many(
             [{"sae_name": name, "sae_series": series, "index": i} for i in range(cfg.d_sae)]
@@ -296,64 +252,6 @@ class MongoClient:
         return self.analysis_collection.insert_one(
             {"name": name, "sae_name": sae_name, "sae_series": sae_series}
         ).inserted_id
-
-    def update_sae(self, name: str, series: str, update_data: dict[str, Any]):
-        """Update an SAE and all its references.
-
-        If the name is updated, all references in other collections are also updated within a transaction.
-        """
-        new_name = update_data.get("name")
-        if new_name and new_name != name:
-            with self.client.start_session() as session:
-                with session.start_transaction():
-                    self.feature_collection.update_many(
-                        {"sae_name": name, "sae_series": series}, {"$set": {"sae_name": new_name}}, session=session
-                    )
-                    self.analysis_collection.update_many(
-                        {"sae_name": name, "sae_series": series}, {"$set": {"sae_name": new_name}}, session=session
-                    )
-                    self.bookmark_collection.update_many(
-                        {"sae_name": name, "sae_series": series}, {"$set": {"sae_name": new_name}}, session=session
-                    )
-                    self.sae_set_collection.update_many(
-                        {"sae_names": name, "sae_series": series},
-                        {"$set": {"sae_names.$[elem]": new_name}},
-                        array_filters=[{"elem": name}],
-                        session=session,
-                    )
-                    self.circuit_collection.update_many(
-                        {"clt_names": name, "sae_series": series},
-                        {"$set": {"clt_names.$[elem]": new_name}},
-                        array_filters=[{"elem": name}],
-                        session=session,
-                    )
-                    self.circuit_collection.update_many(
-                        {"lorsa_names": name, "sae_series": series},
-                        {"$set": {"lorsa_names.$[elem]": new_name}},
-                        array_filters=[{"elem": name}],
-                        session=session,
-                    )
-                    self.sae_collection.update_one(
-                        {"name": name, "series": series}, {"$set": update_data}, session=session
-                    )
-        else:
-            self.sae_collection.update_one({"name": name, "series": series}, {"$set": update_data})
-
-    def update_sae_set(self, name: str, update_data: dict[str, Any]):
-        """Update an SAE set and all its references.
-
-        If the name is updated, all references in other collections are also updated within a transaction.
-        """
-        new_name = update_data.get("name")
-        if new_name and new_name != name:
-            with self.client.start_session() as session:
-                with session.start_transaction():
-                    self.circuit_collection.update_many(
-                        {"sae_set_name": name}, {"$set": {"sae_set_name": new_name}}, session=session
-                    )
-                    self.sae_set_collection.update_one({"name": name}, {"$set": update_data}, session=session)
-        else:
-            self.sae_set_collection.update_one({"name": name}, {"$set": update_data})
 
     def remove_sae(self, sae_name: str, sae_series: str | None = None):
         self.analysis_collection.delete_many({"sae_name": sae_name, "sae_series": sae_series})
@@ -396,20 +294,6 @@ class MongoClient:
             feature = self._from_gridfs(feature)
 
         return FeatureRecord.model_validate(feature)
-
-    def list_features(
-        self, sae_name: str, sae_series: str | None, indices: list[int], with_samplings: bool = True
-    ) -> list[FeatureRecord]:
-        projection = {"analyses.samplings": 0} if not with_samplings else None
-
-        features = self.feature_collection.find(
-            {"sae_name": sae_name, "sae_series": sae_series, "index": {"$in": indices}}, projection=projection
-        ).sort("index", pymongo.ASCENDING)
-
-        if self.is_gridfs_enabled():
-            features = [self._from_gridfs(feature) for feature in features]
-
-        return [FeatureRecord.model_validate(feature) for feature in features]
 
     def get_analysis(self, name: str, sae_name: str, sae_series: str) -> Optional[AnalysisRecord]:
         analysis = self.analysis_collection.find_one({"name": name, "sae_name": sae_name, "sae_series": sae_series})
@@ -521,12 +405,6 @@ class MongoClient:
             return None
         return sae["path"]
 
-    def get_sae_model_name(self, sae_name: str, sae_series: str) -> Optional[str]:
-        sae = self.sae_collection.find_one({"name": sae_name, "series": sae_series})
-        if sae is None:
-            return None
-        return sae["model_name"]
-
     def add_dataset(self, name: str, cfg: DatasetConfig):
         self.dataset_collection.update_one({"name": name}, {"$set": {"cfg": cfg.model_dump()}}, upsert=True)
 
@@ -551,7 +429,7 @@ class MongoClient:
             self.enable_gridfs()
 
         operations = []
-        for i, feature_analysis in enumerate(tqdm(analysis, desc="Adding feature analyses to MongoDB...")):
+        for i, feature_analysis in enumerate(analysis):
             # Convert numpy arrays to GridFS references
             processed_analysis = self._to_gridfs(feature_analysis)
             update_operation = pymongo.UpdateOne(
@@ -578,9 +456,7 @@ class MongoClient:
         self.analysis_collection.delete_many({"sae_name": sae_name, "sae_series": sae_series})
         self.sae_collection.delete_one({"name": sae_name, "series": sae_series})
 
-    def update_feature(
-        self, sae_name: str, feature_index: int, update_data: dict, sae_series: str | None = None
-    ) -> pymongo.results.UpdateResult:
+    def update_feature(self, sae_name: str, feature_index: int, update_data: dict, sae_series: str | None = None):
         """Update a feature with additional data.
 
         Args:
@@ -590,7 +466,7 @@ class MongoClient:
             sae_series: Optional series of the SAE
 
         Returns:
-            Result of the update operation.
+            Result of the update operation
 
         Raises:
             ValueError: If the feature doesn't exist
@@ -618,7 +494,7 @@ class MongoClient:
 
     def update_features(self, sae_name: str, sae_series: str, update_data: list[dict], start_idx: int = 0):
         operations = []
-        for i, feature_update in enumerate(tqdm(update_data, desc="Updating features in MongoDB...")):
+        for i, feature_update in enumerate(update_data):
             update_operation = pymongo.UpdateOne(
                 {"sae_name": sae_name, "sae_series": sae_series, "index": start_idx + i},
                 {"$set": feature_update},
@@ -740,7 +616,18 @@ class MongoClient:
         limit: Optional[int] = None,
         skip: int = 0,
     ) -> list[BookmarkRecord]:
-        """List bookmarks with optional filtering."""
+        """List bookmarks with optional filtering.
+
+        Args:
+            sae_name: Optional SAE name filter
+            sae_series: Optional SAE series filter
+            tags: Optional list of tags to filter by (matches any tag)
+            limit: Optional limit on number of results
+            skip: Number of results to skip (for pagination)
+
+        Returns:
+            list[BookmarkRecord]: List of bookmark records
+        """
         query = {}
 
         if sae_name is not None:
@@ -767,7 +654,18 @@ class MongoClient:
         tags: Optional[list[str]] = None,
         notes: Optional[str] = None,
     ) -> bool:
-        """Update an existing bookmark."""
+        """Update an existing bookmark.
+
+        Args:
+            sae_name: Name of the SAE
+            sae_series: Series of the SAE
+            feature_index: Index of the feature
+            tags: Optional new tags for the bookmark
+            notes: Optional new notes for the bookmark
+
+        Returns:
+            bool: True if bookmark was updated, False if it doesn't exist
+        """
         update_data = {}
         if tags is not None:
             update_data["tags"] = tags
@@ -788,7 +686,15 @@ class MongoClient:
         return result.modified_count > 0
 
     def get_bookmark_count(self, sae_name: Optional[str] = None, sae_series: Optional[str] = None) -> int:
-        """Get the total count of bookmarks with optional filtering."""
+        """Get the total count of bookmarks with optional filtering.
+
+        Args:
+            sae_name: Optional SAE name filter
+            sae_series: Optional SAE series filter
+
+        Returns:
+            int: Total number of bookmarks matching the criteria
+        """
         query = {}
         if sae_name is not None:
             query["sae_name"] = sae_name
@@ -854,310 +760,581 @@ class MongoClient:
 
         return self.feature_collection.count_documents(match_filter)
 
-    def add_sae_set(self, name: str, sae_series: str, sae_names: list[str]):
-        self.sae_set_collection.insert_one({"name": name, "sae_series": sae_series, "sae_names": sae_names})
+    # ============================================================================
+    # Circuit Annotation Methods
+    # ============================================================================
 
-    def get_sae_set(self, name: str) -> Optional[SAESetRecord]:
-        sae_set = self.sae_set_collection.find_one({"name": name})
-        if sae_set is None:
-            return None
-        return SAESetRecord.model_validate(sae_set)
-
-    def list_sae_sets(self) -> list[SAESetRecord]:
-        return [SAESetRecord.model_validate(sae_set) for sae_set in self.sae_set_collection.find()]
-
-    def remove_sae_set(self, name: str, sae_series: str):
-        self.sae_set_collection.delete_one({"name": name, "sae_series": sae_series})
-        self.circuit_collection.delete_many({"sae_set_name": name, "sae_series": sae_series})
-
-    def create_circuit(
+    def create_circuit_annotation(
         self,
-        sae_set_name: str,
-        sae_series: str,
-        prompt: str,
-        input: CircuitInput,
-        config: CircuitConfig,
-        name: Optional[str] = None,
-        group: Optional[str] = None,
-        parent_id: Optional[str] = None,
-        clt_names: Optional[list[str]] = None,
-        lorsa_names: Optional[list[str]] = None,
-        use_lorsa: bool = True,
-    ) -> str:
-        """Create a new circuit graph record with pending status.
+        circuit_id: str,
+        circuit_interpretation: str,
+        sae_combo_id: str,
+        features: list[dict[str, Any]],
+        edges: Optional[list[dict[str, Any]]] = None,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> bool:
+        """Create a new circuit annotation.
 
         Args:
-            sae_set_name: Name of the SAE set used.
-            sae_series: Series of the SAE.
-            prompt: The prompt used for generation.
-            input: The circuit input configuration.
-            config: The circuit configuration.
-            name: Optional custom name for the circuit.
-            group: Optional group name.
-            parent_id: Optional parent circuit ID.
-            clt_names: Names of CLT SAEs used.
-            lorsa_names: Names of LORSA SAEs used.
-            use_lorsa: Whether LORSA was used.
+            circuit_id: Unique identifier for the circuit annotation
+            circuit_interpretation: Interpretation text for the entire circuit
+            sae_combo_id: SAE combination ID associated with this circuit
+            features: List of feature dictionaries, each containing:
+                - sae_name: Name of the SAE
+                - sae_series: Series of the SAE
+                - layer: Layer number (actual layer in the model)
+                - feature_index: Index of the feature
+                - feature_type: Type of feature ("transcoder" or "lorsa")
+                - interpretation: Interpretation text for this feature
+                - level: Optional circuit level (independent of layer, for visualization)
+                - feature_id: Optional unique identifier for this feature in the circuit
+            edges: Optional list of edge dictionaries, each containing:
+                - source_feature_id: ID of the source feature
+                - target_feature_id: ID of the target feature
+                - weight: Weight of the edge
+                - interpretation: Optional interpretation text for this edge
+            metadata: Optional metadata dictionary
 
         Returns:
-            The ID of the created circuit.
-        """
-        circuit_data = {
-            "name": name,
-            "group": group,
-            "parent_id": parent_id,
-            "sae_set_name": sae_set_name,
-            "sae_series": sae_series,
-            "prompt": prompt,
-            "input": input.model_dump(),
-            "config": config.model_dump(),
-            "created_at": datetime.utcnow(),
-            "status": CircuitStatus.PENDING,
-            "progress": 0.0,
-            "progress_phase": None,
-            "error_message": None,
-            "raw_graph_id": None,
-            "clt_names": clt_names,
-            "lorsa_names": lorsa_names,
-            "use_lorsa": use_lorsa,
-        }
-        result = self.circuit_collection.insert_one(circuit_data)
-        return str(result.inserted_id)
+            bool: True if circuit annotation was created, False if it already exists
 
-    def get_circuit(self, circuit_id: str) -> Optional[CircuitRecord]:
-        """Get a circuit by its ID."""
+        Raises:
+            ValueError: If any feature in the list doesn't exist
+        """
+        # Validate that all features exist
+        for feature in features:
+            sae_name = feature.get("sae_name")
+            sae_series = feature.get("sae_series")
+            feature_index = feature.get("feature_index")
+            if sae_name and sae_series is not None and feature_index is not None:
+                existing_feature = self.get_feature(sae_name, sae_series, feature_index)
+                if existing_feature is None:
+                    raise ValueError(
+                        f"Feature {feature_index} not found for SAE {sae_name}/{sae_series}"
+                    )
+        
+        # Generate feature_id for each feature if not provided
+        import uuid
+        feature_id_map = {}
+        for i, feature in enumerate(features):
+            if "feature_id" not in feature:
+                feature["feature_id"] = str(uuid.uuid4())
+            feature_id_map[i] = feature["feature_id"]
+        
+        # Validate edges if provided
+        if edges is not None:
+            feature_ids = {f.get("feature_id") for f in features if f.get("feature_id")}
+            for edge in edges:
+                source_id = edge.get("source_feature_id")
+                target_id = edge.get("target_feature_id")
+                if source_id not in feature_ids:
+                    raise ValueError(f"Source feature_id {source_id} not found in features")
+                if target_id not in feature_ids:
+                    raise ValueError(f"Target feature_id {target_id} not found in features")
+                if "weight" not in edge:
+                    edge["weight"] = 0.0
+
+        now = datetime.utcnow()
+        circuit_data = {
+            "circuit_id": circuit_id,
+            "circuit_interpretation": circuit_interpretation,
+            "sae_combo_id": sae_combo_id,
+            "features": features,
+            "edges": edges or [],
+            "created_at": now,
+            "updated_at": now,
+            "metadata": metadata or {},
+        }
+
         try:
-            circuit = self.circuit_collection.find_one({"_id": ObjectId(circuit_id)})
-        except Exception:
-            return None
+            result = self.circuit_annotations_collection.insert_one(circuit_data)
+            return result.inserted_id is not None
+        except pymongo.errors.DuplicateKeyError:
+            return False
+
+    def get_circuit_annotation(self, circuit_id: str) -> Optional[CircuitAnnotationRecord]:
+        """Get a circuit annotation by ID.
+
+        Args:
+            circuit_id: Unique identifier for the circuit annotation
+
+        Returns:
+            CircuitAnnotationRecord: The circuit annotation record if it exists, None otherwise
+        """
+        circuit = self.circuit_annotations_collection.find_one({"circuit_id": circuit_id})
         if circuit is None:
             return None
-        circuit["id"] = str(circuit.pop("_id"))
-        return CircuitRecord.model_validate(circuit)
+        return CircuitAnnotationRecord.model_validate(circuit)
 
-    def list_circuits(
+    def list_circuit_annotations(
         self,
-        sae_series: Optional[str] = None,
-        group: Optional[str] = None,
+        sae_combo_id: Optional[str] = None,
         limit: Optional[int] = None,
         skip: int = 0,
-    ) -> list[dict[str, Any]]:
-        """List circuits with optional filtering.
+    ) -> list[CircuitAnnotationRecord]:
+        """List circuit annotations with optional filtering.
 
-        Note: raw_graph_id is excluded from the listing for efficiency.
+        Args:
+            sae_combo_id: Optional SAE combination ID filter
+            limit: Optional limit on number of results
+            skip: Number of results to skip (for pagination)
+
+        Returns:
+            list[CircuitAnnotationRecord]: List of circuit annotation records
         """
-        query: dict[str, Any] = {}
-        if sae_series is not None:
-            query["sae_series"] = sae_series
-        if group is not None:
-            query["group"] = group
+        query = {}
+        if sae_combo_id is not None:
+            query["sae_combo_id"] = sae_combo_id
 
-        # Exclude raw_graph_id from listing
-        projection = {"raw_graph_id": 0}
-
-        cursor = self.circuit_collection.find(query, projection=projection).sort("created_at", pymongo.DESCENDING)
+        cursor = self.circuit_annotations_collection.find(query).sort("updated_at", pymongo.DESCENDING)
 
         if skip > 0:
             cursor = cursor.skip(skip)
         if limit is not None:
             cursor = cursor.limit(limit)
 
-        circuits = []
-        for circuit in cursor:
-            circuit["id"] = str(circuit.pop("_id"))
-            circuits.append(circuit)
-        return circuits
+        return [CircuitAnnotationRecord.model_validate(circuit) for circuit in cursor]
 
-    def update_circuits_group(self, circuit_ids: list[str], group: Optional[str]) -> int:
-        """Update the group for multiple circuits."""
-        try:
-            object_ids = [ObjectId(cid) for cid in circuit_ids]
-        except Exception:
-            return 0
-        result = self.circuit_collection.update_many({"_id": {"$in": object_ids}}, {"$set": {"group": group}})
-        return result.modified_count
+    def update_circuit_interpretation(self, circuit_id: str, circuit_interpretation: str) -> bool:
+        """Update the interpretation text for a circuit annotation.
 
-    def update_circuit(self, circuit_id: str, update_data: dict[str, Any]) -> bool:
-        """Update a circuit by its ID."""
-        try:
-            result = self.circuit_collection.update_one({"_id": ObjectId(circuit_id)}, {"$set": update_data})
-        except Exception:
-            return False
+        Args:
+            circuit_id: Unique identifier for the circuit annotation
+            circuit_interpretation: New interpretation text for the entire circuit
+
+        Returns:
+            bool: True if circuit annotation was updated, False if it doesn't exist
+        """
+        result = self.circuit_annotations_collection.update_one(
+            {"circuit_id": circuit_id},
+            {"$set": {"circuit_interpretation": circuit_interpretation, "updated_at": datetime.utcnow()}},
+        )
         return result.modified_count > 0
 
-    def delete_circuit(self, circuit_id: str) -> bool:
-        """Delete a circuit by its ID.
+    def add_feature_to_circuit(
+        self,
+        circuit_id: str,
+        sae_name: str,
+        sae_series: str,
+        layer: int,
+        feature_index: int,
+        feature_type: str,
+        interpretation: str,
+    ) -> bool:
+        """Add a feature to a circuit annotation.
 
-        Also deletes the associated raw graph from GridFS if it exists.
+        Args:
+            circuit_id: Unique identifier for the circuit annotation
+            sae_name: Name of the SAE
+            sae_series: Series of the SAE
+            layer: Layer number
+            feature_index: Index of the feature
+            feature_type: Type of feature ("transcoder" or "lorsa")
+            interpretation: Interpretation text for this feature
+
+        Returns:
+            bool: True if feature was added, False if circuit doesn't exist or feature already in circuit
+
+        Raises:
+            ValueError: If the feature doesn't exist
         """
-        try:
-            # First get the circuit to find raw_graph_id
-            circuit = self.circuit_collection.find_one({"_id": ObjectId(circuit_id)})
-            if circuit and circuit.get("raw_graph_id") and self.fs:
-                try:
-                    self.fs.delete(ObjectId(circuit["raw_graph_id"]))
-                except Exception:
-                    pass  # Ignore errors when deleting GridFS file
+        # Validate that the feature exists
+        existing_feature = self.get_feature(sae_name, sae_series, feature_index)
+        if existing_feature is None:
+            raise ValueError(f"Feature {feature_index} not found for SAE {sae_name}/{sae_series}")
 
-            result = self.circuit_collection.delete_one({"_id": ObjectId(circuit_id)})
-        except Exception:
+        feature_data = {
+            "sae_name": sae_name,
+            "sae_series": sae_series,
+            "layer": layer,
+            "feature_index": feature_index,
+            "feature_type": feature_type,
+            "interpretation": interpretation,
+        }
+
+        # Check if feature already exists in circuit
+        circuit = self.circuit_annotations_collection.find_one({"circuit_id": circuit_id})
+        if circuit is None:
             return False
+
+        # Check for duplicate feature
+        existing_features = circuit.get("features", [])
+        for feat in existing_features:
+            if (
+                feat.get("sae_name") == sae_name
+                and feat.get("sae_series") == sae_series
+                and feat.get("layer") == layer
+                and feat.get("feature_index") == feature_index
+                and feat.get("feature_type") == feature_type
+            ):
+                return False  # Feature already in circuit
+
+        result = self.circuit_annotations_collection.update_one(
+            {"circuit_id": circuit_id},
+            {"$push": {"features": feature_data}, "$set": {"updated_at": datetime.utcnow()}},
+        )
+        return result.modified_count > 0
+
+    def remove_feature_from_circuit(
+        self,
+        circuit_id: str,
+        sae_name: str,
+        sae_series: str,
+        layer: int,
+        feature_index: int,
+        feature_type: str,
+    ) -> bool:
+        """Remove a feature from a circuit annotation.
+
+        Args:
+            circuit_id: Unique identifier for the circuit annotation
+            sae_name: Name of the SAE
+            sae_series: Series of the SAE
+            layer: Layer number
+            feature_index: Index of the feature
+            feature_type: Type of feature ("transcoder" or "lorsa")
+
+        Returns:
+            bool: True if feature was removed, False if circuit doesn't exist or feature not in circuit
+        """
+        result = self.circuit_annotations_collection.update_one(
+            {
+                "circuit_id": circuit_id,
+                "features": {
+                    "$elemMatch": {
+                        "sae_name": sae_name,
+                        "sae_series": sae_series,
+                        "layer": layer,
+                        "feature_index": feature_index,
+                        "feature_type": feature_type,
+                    }
+                },
+            },
+            {
+                "$pull": {
+                    "features": {
+                        "sae_name": sae_name,
+                        "sae_series": sae_series,
+                        "layer": layer,
+                        "feature_index": feature_index,
+                        "feature_type": feature_type,
+                    }
+                },
+                "$set": {"updated_at": datetime.utcnow()},
+            },
+        )
+        return result.modified_count > 0
+
+    def update_feature_interpretation_in_circuit(
+        self,
+        circuit_id: str,
+        sae_name: str,
+        sae_series: str,
+        layer: int,
+        feature_index: int,
+        feature_type: str,
+        interpretation: str,
+    ) -> bool:
+        """Update the interpretation text for a specific feature in a circuit annotation.
+
+        Args:
+            circuit_id: Unique identifier for the circuit annotation
+            sae_name: Name of the SAE
+            sae_series: Series of the SAE
+            layer: Layer number
+            feature_index: Index of the feature
+            feature_type: Type of feature ("transcoder" or "lorsa")
+            interpretation: New interpretation text for this feature
+
+        Returns:
+            bool: True if feature interpretation was updated, False if circuit or feature doesn't exist
+        """
+        result = self.circuit_annotations_collection.update_one(
+            {
+                "circuit_id": circuit_id,
+                "features": {
+                    "$elemMatch": {
+                        "sae_name": sae_name,
+                        "sae_series": sae_series,
+                        "layer": layer,
+                        "feature_index": feature_index,
+                        "feature_type": feature_type,
+                    }
+                },
+            },
+            {
+                "$set": {
+                    "features.$.interpretation": interpretation,
+                    "updated_at": datetime.utcnow(),
+                }
+            },
+        )
+        return result.modified_count > 0
+
+    def get_circuits_by_feature(
+        self,
+        sae_name: str,
+        sae_series: str,
+        layer: int,
+        feature_index: int,
+        feature_type: Optional[str] = None,
+    ) -> list[CircuitAnnotationRecord]:
+        """Get all circuit annotations that contain a specific feature.
+
+        Args:
+            sae_name: Name of the SAE
+            sae_series: Series of the SAE
+            layer: Layer number
+            feature_index: Index of the feature
+            feature_type: Optional type of feature ("transcoder" or "lorsa") to filter by
+
+        Returns:
+            list[CircuitAnnotationRecord]: List of circuit annotation records containing the feature
+        """
+        query: dict[str, Any] = {
+            "features": {
+                "$elemMatch": {
+                    "sae_name": sae_name,
+                    "sae_series": sae_series,
+                    "layer": layer,
+                    "feature_index": feature_index,
+                }
+            }
+        }
+
+        if feature_type is not None:
+            query["features"]["$elemMatch"]["feature_type"] = feature_type
+
+        circuits = self.circuit_annotations_collection.find(query).sort("updated_at", pymongo.DESCENDING)
+        return [CircuitAnnotationRecord.model_validate(circuit) for circuit in circuits]
+
+    def delete_circuit_annotation(self, circuit_id: str) -> bool:
+        """Delete a circuit annotation.
+
+        Args:
+            circuit_id: Unique identifier for the circuit annotation
+
+        Returns:
+            bool: True if circuit annotation was deleted, False if it doesn't exist
+        """
+        result = self.circuit_annotations_collection.delete_one({"circuit_id": circuit_id})
         return result.deleted_count > 0
 
-    def update_circuit_progress(
+    def get_circuit_annotation_count(self, sae_combo_id: Optional[str] = None) -> int:
+        """Get the total count of circuit annotations with optional filtering.
+
+        Args:
+            sae_combo_id: Optional SAE combination ID filter
+
+        Returns:
+            int: Total number of circuit annotations matching the criteria
+        """
+        query = {}
+        if sae_combo_id is not None:
+            query["sae_combo_id"] = sae_combo_id
+
+        return self.circuit_annotations_collection.count_documents(query)
+
+    def add_edge_to_circuit(
         self,
         circuit_id: str,
-        progress: float,
-        progress_phase: Optional[str] = None,
+        source_feature_id: str,
+        target_feature_id: str,
+        weight: float = 0.0,
+        interpretation: Optional[str] = None,
     ) -> bool:
-        """Update the progress of a circuit generation.
+        """Add an edge between two features in a circuit annotation.
 
         Args:
-            circuit_id: The circuit ID.
-            progress: Progress percentage (0-100).
-            progress_phase: Optional phase description.
+            circuit_id: Unique identifier for the circuit annotation
+            source_feature_id: ID of the source feature
+            target_feature_id: ID of the target feature
+            weight: Weight of the edge
+            interpretation: Optional interpretation text for this edge
 
         Returns:
-            True if update was successful.
+            bool: True if edge was added, False if circuit doesn't exist or edge already exists
+
+        Raises:
+            ValueError: If source or target feature doesn't exist in the circuit
         """
-        update_data: dict[str, Any] = {"progress": progress}
-        if progress_phase is not None:
-            update_data["progress_phase"] = progress_phase
-
-        try:
-            result = self.circuit_collection.update_one(
-                {"_id": ObjectId(circuit_id)},
-                {"$set": update_data},
-            )
-        except Exception:
-            return False
-        return result.modified_count > 0
-
-    def update_circuit_status(
-        self,
-        circuit_id: str,
-        status: str,
-        error_message: Optional[str] = None,
-    ) -> bool:
-        """Update the status of a circuit.
-
-        Args:
-            circuit_id: The circuit ID.
-            status: New status (pending, running, completed, failed).
-            error_message: Optional error message for failed status.
-
-        Returns:
-            True if update was successful.
-        """
-        update_data: dict[str, Any] = {"status": status}
-        if error_message is not None:
-            update_data["error_message"] = error_message
-
-        try:
-            result = self.circuit_collection.update_one(
-                {"_id": ObjectId(circuit_id)},
-                {"$set": update_data},
-            )
-        except Exception:
-            return False
-        return result.modified_count > 0
-
-    def store_raw_graph(self, circuit_id: str, graph_data: dict[str, Any]) -> bool:
-        """Store raw graph data to GridFS and update circuit record.
-
-        Args:
-            circuit_id: The circuit ID.
-            graph_data: The raw graph data dictionary with numpy arrays.
-
-        Returns:
-            True if storage was successful.
-        """
-        if not self.is_gridfs_enabled():
-            self.enable_gridfs()
-
-        assert self.fs is not None
-
-        try:
-            # Convert numpy arrays to GridFS references
-            processed_data = self._to_gridfs(graph_data)
-
-            # Store in GridFS as a single document
-            import pickle
-
-            # Use pickle for complex data with GridFS references
-            graph_bytes = pickle.dumps(processed_data)
-            graph_id = self.fs.put(graph_bytes, filename=f"circuit_{circuit_id}_graph")
-
-            # Update circuit record with graph ID
-            result = self.circuit_collection.update_one(
-                {"_id": ObjectId(circuit_id)},
-                {"$set": {"raw_graph_id": str(graph_id)}},
-            )
-            return result.modified_count > 0
-        except Exception:
-            return False
-
-    def load_raw_graph(self, circuit_id: str) -> Optional[dict[str, Any]]:
-        """Load raw graph data from GridFS.
-
-        Args:
-            circuit_id: The circuit ID.
-
-        Returns:
-            The raw graph data dictionary with numpy arrays, or None if not found.
-        """
-        if not self.is_gridfs_enabled():
-            self.enable_gridfs()
-
-        assert self.fs is not None
-
-        try:
-            circuit = self.circuit_collection.find_one({"_id": ObjectId(circuit_id)})
-            if circuit is None or circuit.get("raw_graph_id") is None:
-                return None
-
-            graph_id = ObjectId(circuit["raw_graph_id"])
-            if not self.fs.exists(graph_id):
-                return None
-
-            import pickle
-
-            graph_bytes = self.fs.get(graph_id).read()
-            processed_data = pickle.loads(graph_bytes)
-
-            # Convert GridFS references back to numpy arrays
-            return self._from_gridfs(processed_data)
-        except Exception:
-            return None
-
-    def get_circuit_status(self, circuit_id: str) -> Optional[dict[str, Any]]:
-        """Get just the status information for a circuit.
-
-        Args:
-            circuit_id: The circuit ID.
-
-        Returns:
-            Dict with status, progress, progress_phase, and error_message.
-        """
-        try:
-            circuit = self.circuit_collection.find_one(
-                {"_id": ObjectId(circuit_id)},
-                projection={
-                    "status": 1,
-                    "progress": 1,
-                    "progress_phase": 1,
-                    "error_message": 1,
-                },
-            )
-        except Exception:
-            return None
-
+        circuit = self.circuit_annotations_collection.find_one({"circuit_id": circuit_id})
         if circuit is None:
-            return None
+            return False
 
-        return {
-            "status": circuit.get("status", CircuitStatus.PENDING),
-            "progress": circuit.get("progress", 0.0),
-            "progress_phase": circuit.get("progress_phase"),
-            "error_message": circuit.get("error_message"),
+        # Validate that both features exist in the circuit
+        feature_ids = {f.get("feature_id") for f in circuit.get("features", [])}
+        if source_feature_id not in feature_ids:
+            raise ValueError(f"Source feature_id {source_feature_id} not found in circuit")
+        if target_feature_id not in feature_ids:
+            raise ValueError(f"Target feature_id {target_feature_id} not found in circuit")
+
+        # Check if edge already exists
+        existing_edges = circuit.get("edges", [])
+        for edge in existing_edges:
+            if (
+                edge.get("source_feature_id") == source_feature_id
+                and edge.get("target_feature_id") == target_feature_id
+            ):
+                return False  # Edge already exists
+
+        edge_data = {
+            "source_feature_id": source_feature_id,
+            "target_feature_id": target_feature_id,
+            "weight": weight,
         }
+        if interpretation is not None:
+            edge_data["interpretation"] = interpretation
+
+        result = self.circuit_annotations_collection.update_one(
+            {"circuit_id": circuit_id},
+            {"$push": {"edges": edge_data}, "$set": {"updated_at": datetime.utcnow()}},
+        )
+        return result.modified_count > 0
+
+    def remove_edge_from_circuit(
+        self,
+        circuit_id: str,
+        source_feature_id: str,
+        target_feature_id: str,
+    ) -> bool:
+        """Remove an edge from a circuit annotation.
+
+        Args:
+            circuit_id: Unique identifier for the circuit annotation
+            source_feature_id: ID of the source feature
+            target_feature_id: ID of the target feature
+
+        Returns:
+            bool: True if edge was removed, False if circuit doesn't exist or edge not found
+        """
+        result = self.circuit_annotations_collection.update_one(
+            {"circuit_id": circuit_id},
+            {
+                "$pull": {
+                    "edges": {
+                        "source_feature_id": source_feature_id,
+                        "target_feature_id": target_feature_id,
+                    }
+                },
+                "$set": {"updated_at": datetime.utcnow()},
+            },
+        )
+        return result.modified_count > 0
+
+    def update_edge_weight(
+        self,
+        circuit_id: str,
+        source_feature_id: str,
+        target_feature_id: str,
+        weight: float,
+        interpretation: Optional[str] = None,
+    ) -> bool:
+        """Update the weight of an edge in a circuit annotation.
+
+        Args:
+            circuit_id: Unique identifier for the circuit annotation
+            source_feature_id: ID of the source feature
+            target_feature_id: ID of the target feature
+            weight: New weight for the edge
+            interpretation: Optional new interpretation text for the edge
+
+        Returns:
+            bool: True if edge was updated, False if circuit or edge doesn't exist
+        """
+        circuit = self.circuit_annotations_collection.find_one({"circuit_id": circuit_id})
+        if circuit is None:
+            return False
+
+        edges = circuit.get("edges", [])
+        edge_index = None
+        for i, edge in enumerate(edges):
+            if (
+                edge.get("source_feature_id") == source_feature_id
+                and edge.get("target_feature_id") == target_feature_id
+            ):
+                edge_index = i
+                break
+
+        if edge_index is None:
+            return False  # Edge not found
+
+        # Update the edge
+        update_data = {"edges.$.weight": weight}
+        if interpretation is not None:
+            update_data["edges.$.interpretation"] = interpretation
+
+        update_data["updated_at"] = datetime.utcnow()
+        result = self.circuit_annotations_collection.update_one(
+            {
+                "circuit_id": circuit_id,
+                "edges": {
+                    "$elemMatch": {
+                        "source_feature_id": source_feature_id,
+                        "target_feature_id": target_feature_id,
+                    }
+                },
+            },
+            {"$set": update_data},
+        )
+        return result.modified_count > 0
+
+    def set_feature_level(
+        self,
+        circuit_id: str,
+        feature_id: str,
+        level: int,
+    ) -> bool:
+        """Set the circuit level for a feature in a circuit annotation.
+
+        Args:
+            circuit_id: Unique identifier for the circuit annotation
+            feature_id: ID of the feature
+            level: Circuit level (independent of layer, for visualization)
+
+        Returns:
+            bool: True if feature level was updated, False if circuit or feature doesn't exist
+        """
+        circuit = self.circuit_annotations_collection.find_one({"circuit_id": circuit_id})
+        if circuit is None:
+            return False
+
+        # Check if feature exists in circuit
+        features = circuit.get("features", [])
+        feature_index = None
+        for i, feature in enumerate(features):
+            if feature.get("feature_id") == feature_id:
+                feature_index = i
+                break
+
+        if feature_index is None:
+            return False  # Feature not found
+
+        result = self.circuit_annotations_collection.update_one(
+            {
+                "circuit_id": circuit_id,
+                "features": {"$elemMatch": {"feature_id": feature_id}},
+            },
+            {"$set": {"features.$.level": level, "updated_at": datetime.utcnow()}},
+        )
+        return result.modified_count > 0
+
+    def update_feature_level(
+        self,
+        circuit_id: str,
+        feature_id: str,
+        level: int,
+    ) -> bool:
+        """Update the circuit level for a feature in a circuit annotation.
+        
+        Alias for set_feature_level for consistency.
+
+        Args:
+            circuit_id: Unique identifier for the circuit annotation
+            feature_id: ID of the feature
+            level: Circuit level (independent of layer, for visualization)
+
+        Returns:
+            bool: True if feature level was updated, False if circuit or feature doesn't exist
+        """
+        return self.set_feature_level(circuit_id, feature_id, level)

@@ -22,7 +22,7 @@ import torch
 from datasets import Dataset
 from pydantic import BaseModel
 
-from lm_saes.analysis.samples import Segment, TokenizedSample
+from lm_saes.analysis.samples import Segment, TokenizedSample, build_chess_tokenized_sample
 from lm_saes.backend.language_model import LanguageModel
 from lm_saes.database import FeatureAnalysis, FeatureRecord, MongoClient
 from lm_saes.utils.logging import get_logger
@@ -40,8 +40,89 @@ from .explanation_prompts import (
     generate_explanation_prompt,
     generate_explanation_prompt_neuronpedia,
 )
+from .explanation_prompts_chess import (
+    generate_explanation_prompt_chess,
+    generate_format_interpretation_prompt_chess,
+)
 
 logger = get_logger("analysis.feature_interpreter")
+
+# BT4 HookedTransformer loaded once for the whole autointerp (used for WDL via chess_utils.get_wdl_from_model).
+_BT4_HOOKED_MODEL: Any = None
+_BT4_MODEL_NAME = "lc0/BT4-1024x15x32h"
+
+# Per-source cap for z_pattern: for each activated square as source, keep at most this many (largest |z_pattern|).
+# Adjust this to control how many contributing targets are kept (e.g. 6, 8, 12). Frontend chess board uses 8.
+MAX_Z_PATTERN_TARGETS_PER_SOURCE = 3
+
+
+def _get_bt4_hooked_model(device: str = "cuda") -> Any | None:
+    """Load BT4 HookedTransformer once; reuse the same instance for the whole autointerp."""
+    global _BT4_HOOKED_MODEL
+    if _BT4_HOOKED_MODEL is not None:
+        return _BT4_HOOKED_MODEL
+    try:
+        from transformer_lens import HookedTransformer
+
+        _BT4_HOOKED_MODEL = HookedTransformer.from_pretrained_no_processing(
+            _BT4_MODEL_NAME,
+            dtype=torch.float32,
+        ).eval()
+        if device:
+            _BT4_HOOKED_MODEL = _BT4_HOOKED_MODEL.to(device)
+        return _BT4_HOOKED_MODEL
+    except Exception as e:
+        logger.warning("Failed to load BT4 HookedTransformer for WDL: %s", e)
+        return None
+
+
+def _get_wdl_from_model(_model: Any, fen_str: str, device: str = "cuda") -> tuple[float, float, float] | None:
+    """Get (win, draw, loss) for the side to move using chess_utils.get_wdl_from_model and a single BT4 HookedTransformer.
+
+    The BT4 model is loaded once per process via _get_bt4_hooked_model and reused. _model (LanguageModel) is not used.
+    Returns None if chess_utils or BT4 load fails.
+    """
+    try:
+        from src.chess_utils import get_wdl_from_model as _get_wdl
+    except ImportError:
+        return None
+    hooked = _get_bt4_hooked_model(device=device)
+    if hooked is None:
+        return None
+    try:
+        w, d, l = _get_wdl(hooked, fen_str)
+        return (float(w), float(d), float(l))
+    except Exception:
+        return None
+
+
+def _get_top_moves_from_model(
+    _model: Any, fen_str: str, top_k: int = 3, device: str = "cuda"
+) -> list[tuple[str, float]] | None:
+    """Get top-k predicted moves (UCI, probability) for the position using BT4 HookedTransformer.
+
+    The BT4 model is loaded once per process via _get_bt4_hooked_model and reused. _model (LanguageModel) is not used.
+    Returns None if chess_utils or BT4 load fails. Otherwise returns a list of (uci, prob) of length at most top_k.
+    """
+    try:
+        from src.chess_utils.move import get_move_from_policy_output_with_prob
+    except ImportError:
+        return None
+    hooked = _get_bt4_hooked_model(device=device)
+    if hooked is None:
+        return None
+    try:
+        output, _ = hooked.run_with_cache(fen_str, prepend_bos=False)
+        policy_output = output[0][0]
+        result = get_move_from_policy_output_with_prob(
+            policy_output, fen_str, return_list=True
+        )
+        if not result:
+            return None
+        # result is list of (uci, logit, prob); we need (uci, prob)
+        return [(uci, prob) for uci, _logit, prob in result[:top_k]]
+    except Exception:
+        return None
 
 
 class Step(BaseModel):
@@ -140,6 +221,12 @@ def generate_activating_examples(
         List of TokenizedExample with high activation for the feature
     """
     samples: list[TokenizedSample] = []
+    print(
+        "Generating activating examples for feature index %s (sae_name=%s, sae_series=%s)",
+        feature.index,
+        feature.sae_name,
+        feature.sae_series,
+    )
 
     # Get examples from top activations
     sampling = analysis.samplings[0]
@@ -185,33 +272,85 @@ def generate_activating_examples(
         left_end = max(0, max_act_pos - max_length // 2)
         right_end = min(len(origins), max_act_pos + max_length // 2)
 
-        # Create TokenizedExample using the trace information
-        sample = TokenizedSample.construct(
-            text=data["text"],
-            activations=feature_acts[left_end:right_end],
-            origins=origins[left_end:right_end],
-            max_activation=analysis.max_feature_acts,
-        )
+        # Chess format: 64 segments as square+piece (e.g. a1r, a2.), then side_to_move, wdl, fen
+        fen_raw = data.get("fen")
+        if fen_raw is not None and len(origins) == 64:
+            fen_str = fen_raw if isinstance(fen_raw, str) else fen_raw[0]
+            parts = fen_str.split()
+            side_to_move = parts[1] if len(parts) > 1 else "?"
+            wdl = None
+            if "wdl" in data:
+                w = data["wdl"]
+                if isinstance(w, (list, tuple)) and len(w) == 3:
+                    wdl = tuple(float(x) for x in w)
+            if wdl is None:
+                wdl = _get_wdl_from_model(model, fen_str)
+            top_moves = _get_top_moves_from_model(model, fen_str, top_k=3)
+            acts = (
+                feature_acts.flatten()[:64].tolist()
+                if isinstance(feature_acts, torch.Tensor)
+                else list(feature_acts)[:64]
+            )
+            sample = build_chess_tokenized_sample(
+                fen_str,
+                acts,
+                analysis.max_feature_acts,
+                side_to_move=side_to_move,
+                wdl=wdl,
+                top_moves=top_moves,
+            )
+            
+        else:
+            # Create TokenizedExample using the trace information (non-chess)
+            sample = TokenizedSample.construct(
+                text=data.get("fen", data.get("text", "")),
+                activations=feature_acts,
+                origins=origins,
+                max_activation=analysis.max_feature_acts,
+            )
+
         # Find max contributing previous tokens for Lorsa.
         # We want to operate in coo format since zpattern is 3-d.
         if z_pattern_indices is not None and z_pattern_values is not None:
             current_sequence_mask = z_pattern_indices[0] == i
             current_z_pattern_indices = z_pattern_indices[1:, current_sequence_mask]
             current_z_pattern_values = z_pattern_values[current_sequence_mask]
-            # Need to adjust indices since the text has been cropped
-            # and remove negative indices
-            out_of_right_end_indices = current_z_pattern_indices.lt(right_end).all(dim=0)
-            current_z_pattern_indices -= left_end
+            # Chess: sample is full 64 segments (no cropping), so do not shift indices.
+            # Non-chess: indices are cropped by [left_end, right_end), so subtract left_end.
+            if fen_raw is not None and len(origins) == 64:
+                zp_left, zp_right = 0, len(origins)
+            else:
+                zp_left, zp_right = left_end, right_end
+            out_of_right_end_indices = current_z_pattern_indices.lt(zp_right).all(dim=0)
+            current_z_pattern_indices = current_z_pattern_indices - zp_left
             z_pattern_with_negative_indices = current_z_pattern_indices.ge(0).all(dim=0)
             mask = out_of_right_end_indices * z_pattern_with_negative_indices
-            sample.add_z_pattern_data(
-                current_z_pattern_indices[:, mask],
-                current_z_pattern_values[mask],
-                origins,
-            )
+            idx_2d = current_z_pattern_indices[:, mask]
+            val = current_z_pattern_values[mask]
+            # Per source: keep at most MAX_Z_PATTERN_TARGETS_PER_SOURCE entries with largest |z_pattern|
+            if idx_2d.numel() > 0:
+                cap = MAX_Z_PATTERN_TARGETS_PER_SOURCE
+                sources = idx_2d[0]
+                keep = torch.zeros(idx_2d.size(1), dtype=torch.bool, device=idx_2d.device)
+                for s in sources.unique():
+                    src_mask = sources == s
+                    n_src = src_mask.sum().item()
+                    if n_src <= cap:
+                        keep |= src_mask
+                    else:
+                        src_vals = val[src_mask]
+                        src_pos = torch.where(src_mask)[0]
+                        _, order = torch.abs(src_vals).sort(descending=True)
+                        keep[src_pos[order[:cap]]] = True
+                idx_2d = idx_2d[:, keep]
+                val = val[keep]
+            sample.add_z_pattern_data(idx_2d, val, origins)
+
+        # DEBUGGING
+        print(f'{sample = }')
 
         samples.append(sample)
-
+        
         if len(samples) >= n:
             break
 
@@ -278,17 +417,43 @@ def generate_non_activating_examples(
             data = dataset[context_idx]
 
             # Process the sample using model's trace method
-            # lock.acquire()
             origins = model.trace({k: [v] for k, v in data.items()})[0]
-            # lock.release()
 
-            # Create TokenizedExample using the trace information
-            sample = TokenizedSample.construct(
-                text=data["text"],
-                activations=feature_acts[:max_length],
-                origins=origins[:max_length],
-                max_activation=analysis.max_feature_acts,
-            )
+            # Chess format: 64 segments as square+piece, then side_to_move, wdl, fen
+            fen_raw = data.get("fen")
+            if feature_acts.dim() > 1:
+                acts_1d = feature_acts[:, i][:max_length]
+            else:
+                acts_1d = feature_acts[:max_length]
+            if fen_raw is not None and len(origins) == 64:
+                fen_str = fen_raw if isinstance(fen_raw, str) else fen_raw[0]
+                parts = fen_str.split()
+                side_to_move = parts[1] if len(parts) > 1 else "?"
+                wdl = None
+                if "wdl" in data:
+                    w = data["wdl"]
+                    if isinstance(w, (list, tuple)) and len(w) == 3:
+                        wdl = tuple(float(x) for x in w)
+                if wdl is None:
+                    wdl = _get_wdl_from_model(model, fen_str)
+                top_moves = _get_top_moves_from_model(model, fen_str, top_k=3)
+                acts = acts_1d.tolist() if isinstance(acts_1d, torch.Tensor) else list(acts_1d)
+                sample = build_chess_tokenized_sample(
+                    fen_str,
+                    acts,
+                    analysis.max_feature_acts,
+                    side_to_move=side_to_move,
+                    wdl=wdl,
+                    top_moves=top_moves,
+                )
+                
+            else:
+                sample = TokenizedSample.construct(
+                    text=data.get("fen", data.get("text", "")),
+                    activations=acts_1d,
+                    origins=origins[:max_length],
+                    max_activation=analysis.max_feature_acts,
+                )
 
             samples.append(sample)
 
@@ -387,6 +552,10 @@ class FeatureInterpreter:
         """
         if self.cfg.explainer_type is ExplainerType.OPENAI:
             system_prompt, user_prompt = generate_explanation_prompt(self.cfg, activating_examples)
+        elif self.cfg.explainer_type is ExplainerType.NEURONPEDIA_CHESS:
+            system_prompt, user_prompt = generate_explanation_prompt_chess(
+                self.cfg, activating_examples, top_logits
+            )
         else:
             system_prompt, user_prompt = generate_explanation_prompt_neuronpedia(
                 self.cfg, activating_examples, top_logits
@@ -428,6 +597,64 @@ class FeatureInterpreter:
             "response": explanation,
             "time": response_time,
         }
+
+    async def format_interpretation_chess(self, raw_explanation: str) -> str:
+        """Format raw chess interpretation (with reasoning) into a single [Tag]Short description line.
+
+        Args:
+            raw_explanation: Raw model output that may include steps and examples.
+
+        Returns:
+            Single-line formatted interpretation, e.g. [Src]Source square or [Det]OwnPawn.
+            On API failure or empty response, returns the last line of raw_explanation that looks
+            like [Tag]... or the original raw_explanation stripped.
+        """
+        system_prompt, user_prompt = generate_format_interpretation_prompt_chess(raw_explanation)
+        try:
+            response = await self.explainer_client.chat.completions.create(
+                model=self.cfg.openai_model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                stream=False,
+            )
+            content = response.choices[0].message.content
+            if content and content.strip():
+                return content.strip().split("\n")[0].strip()
+            # fallback: take last line that looks like [Tag]...
+            for line in reversed(raw_explanation.strip().split("\n")):
+                line = line.strip()
+                if line and (
+                    line.startswith("[Det]")
+                    or line.startswith("[Src]")
+                    or line.startswith("[Tgt]")
+                    or line.startswith("[Val]")
+                    or line.startswith("[Cap]")
+                    or line.startswith("[Tac]")
+                    or line.startswith("[Spa]")
+                    or line.startswith("[Mov]")
+                    or line.startswith("[Other]")
+                ):
+                    return line
+            return raw_explanation.strip()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Format interpretation failed: %s. Using fallback.", e)
+            for line in reversed(raw_explanation.strip().split("\n")):
+                line = line.strip()
+                if line and (
+                    line.startswith("[Det]")
+                    or line.startswith("[Src]")
+                    or line.startswith("[Tgt]")
+                    or line.startswith("[Val]")
+                    or line.startswith("[Cap]")
+                    or line.startswith("[Tac]")
+                    or line.startswith("[Spa]")
+                    or line.startswith("[Mov]")
+                    or line.startswith("[Other]")
+                ):
+                    return line
+            return raw_explanation.strip()
 
     async def evaluate_explanation_detection(
         self,
@@ -553,7 +780,12 @@ class FeatureInterpreter:
                 Segment(seg.text, sample.max_activation if i in highlight_indices else 0)
                 for i, seg in enumerate(sample.segments)
             ]
-            return TokenizedSample(segments, sample.max_activation)
+            return TokenizedSample(
+                segments=segments,
+                max_activation=sample.max_activation,
+                suffix_text=sample.suffix_text,
+                z_pattern_data=sample.z_pattern_data,
+            )
 
         n_to_highlight = max(3, n_highlighted)  # Highlight at least 3 tokens
         return highlight_random_tokens(sample, n_to_highlight)
@@ -680,6 +912,16 @@ class FeatureInterpreter:
         explanation_result = await self.generate_explanation(activating_examples, top_logits)
         explanation: dict[str, Any] = explanation_result["response"]
         response_time += explanation_result["time"]
+
+        # Chess: format raw output (reasoning + examples) into single line [Tag]Short description
+        if self.cfg.explainer_type is ExplainerType.NEURONPEDIA_CHESS:
+            raw = explanation.get("final_explanation", "")
+            if raw and isinstance(raw, str):
+                print("[autointerp raw_explanation]\n" + raw + "\n[/autointerp raw_explanation]")
+                formatted = await self.format_interpretation_chess(raw)
+                explanation["raw_explanation"] = raw
+                explanation["final_explanation"] = formatted
+
         # Evaluate explanation
         evaluation_results = []
 

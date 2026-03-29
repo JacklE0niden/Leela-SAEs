@@ -11,10 +11,9 @@ import torch
 from torch.distributed.device_mesh import DeviceMesh
 from tqdm import tqdm
 
+from lm_saes.abstract_sae import AbstractSparseAutoEncoder
 from lm_saes.activation.factory import ActivationFactory
-from lm_saes.models.sparse_dictionary import SparseDictionary
 from lm_saes.utils.discrete import KeyedDiscreteMapper
-from lm_saes.utils.distributed.ops import item
 from lm_saes.utils.logging import get_logger
 
 # Set up logger for this module
@@ -30,7 +29,7 @@ class PostAnalysisProcessor(ABC):
 
     def process(
         self,
-        sae: SparseDictionary,
+        sae: AbstractSparseAutoEncoder,
         act_times: torch.Tensor,
         n_analyzed_tokens: int,
         max_feature_acts: torch.Tensor,
@@ -84,9 +83,9 @@ class PostAnalysisProcessor(ABC):
         results = []
         for i in tqdm(range(len(act_times)), desc="Converting results to final per-feature format"):
             feature_result = {
-                "act_times": item(act_times[i]),
+                "act_times": act_times[i].item(),
                 "n_analyzed_tokens": n_analyzed_tokens,
-                "max_feature_acts": item(max_feature_acts[i]),
+                "max_feature_acts": max_feature_acts[i].item(),
                 **(decoder_info[i] if decoder_info is not None else {}),
                 "samplings": [
                     {
@@ -125,7 +124,7 @@ class PostAnalysisProcessor(ABC):
     @abstractmethod
     def _process_tensors(
         self,
-        sae: SparseDictionary,
+        sae: AbstractSparseAutoEncoder,
         act_times: torch.Tensor,
         n_analyzed_tokens: int,
         max_feature_acts: torch.Tensor,

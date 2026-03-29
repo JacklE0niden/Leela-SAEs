@@ -1,7 +1,7 @@
 """Runner module for executing various operations on language models and SAEs."""
 
 from .analyze import (
-    AnalyzeCrosscoderSettings,
+    AnalyzeCrossCoderSettings,
     AnalyzeSAESettings,
     DirectLogitAttributeSettings,
     analyze_crosscoder,
@@ -10,7 +10,7 @@ from .analyze import (
 )
 from .autointerp import AutoInterpSettings, auto_interp
 from .eval import (
-    EvaluateCrosscoderSettings,
+    EvaluateCrossCoderSettings,
     EvaluateSAESettings,
     evaluate_crosscoder,
     evaluate_sae,
@@ -21,12 +21,11 @@ from .generate import (
     check_activation_consistency,
     generate_activations,
 )
-from .topk_to_jumprelu_conversion import ConvertTopKToJumpReLUSettings, convert_topk_to_jumprelu
 from .train import (
     SweepingItem,
     SweepSAESettings,
     TrainCLTSettings,
-    TrainCrosscoderSettings,
+    TrainCrossCoderSettings,
     TrainLorsaSettings,
     TrainMOLTSettings,
     TrainSAESettings,
@@ -37,7 +36,7 @@ from .train import (
     train_molt,
     train_sae,
 )
-from .utils import PretrainedSAE, load_config
+from .utils import load_config
 
 __all__ = [
     "DirectLogitAttributeSettings",
@@ -48,7 +47,7 @@ __all__ = [
     "check_activation_consistency",
     "TrainSAESettings",
     "train_sae",
-    "TrainCrosscoderSettings",
+    "TrainCrossCoderSettings",
     "train_crosscoder",
     "TrainCLTSettings",
     "train_clt",
@@ -57,12 +56,12 @@ __all__ = [
     "sweep_sae",
     "AnalyzeSAESettings",
     "analyze_sae",
-    "AnalyzeCrosscoderSettings",
+    "AnalyzeCrossCoderSettings",
     "analyze_crosscoder",
     "AutoInterpSettings",
     "auto_interp",
     "load_config",
-    "EvaluateCrosscoderSettings",
+    "EvaluateCrossCoderSettings",
     "evaluate_crosscoder",
     "EvaluateSAESettings",
     "evaluate_sae",
@@ -72,7 +71,4 @@ __all__ = [
     "direct_logit_attribute",
     "TrainMOLTSettings",
     "train_molt",
-    "PretrainedSAE",
-    "ConvertTopKToJumpReLUSettings",
-    "convert_topk_to_jumprelu",
 ]
