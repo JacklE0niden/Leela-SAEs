@@ -1959,7 +1959,7 @@ def fill_missing_keys(model, state_dict):
     default_state_dict = model.state_dict()
     # Get the keys that are missing from the pretrained model
     missing_keys = set(default_state_dict.keys()) - set(state_dict.keys())
-    print("[fill_missing_keys] missing_keys:", missing_keys)  # 新增调试打印
+    print("[fill_missing_keys] missing_keys:", missing_keys)  # Added debug print
     # Fill in the missing keys with the default initialization
     for key in missing_keys:
         if "hf_model" in key:

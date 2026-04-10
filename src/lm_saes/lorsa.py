@@ -1068,7 +1068,7 @@ class LowRankSparseAttention(AbstractSparseAutoEncoder):
 
         pattern: Optional[torch.Tensor] = None
         scores: Optional[torch.Tensor] = None
-
+        attn_mask: Optional[torch.Tensor] = None
 
         if getattr(self.cfg, "use_smolgen", True):
             if hasattr(self, "smolgen"):
@@ -1111,9 +1111,14 @@ class LowRankSparseAttention(AbstractSparseAutoEncoder):
                 backends=[SDPBackend.FLASH_ATTENTION, SDPBackend.CUDNN_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
             ):
                 z = F.scaled_dot_product_attention(
-                    query, key, value, scale=1 / self.attn_scale, is_causal=False, enable_gqa=True
+                    query,
+                    key,
+                    value,
+                    attn_mask=attn_mask,
+                    scale=1 / self.attn_scale,
+                    is_causal=False,
+                    enable_gqa=True,
                 )
-            # print(f'{z.shape = }')
             hidden_pre = z.permute(0, 2, 1, 3).reshape(*v.shape)
         else:
             # Attention pattern
@@ -1121,6 +1126,8 @@ class LowRankSparseAttention(AbstractSparseAutoEncoder):
             q = q.permute(2, 0, 1, 3)  # (n_qk_heads, batch, seq_len, d_qk_head)
             k = k.permute(2, 0, 3, 1)  # (n_qk_heads, batch, d_qk_head, seq_len)
             scores = torch.einsum("nbqd,nbdk->nbqk", q, k) / self.attn_scale
+            if attn_mask is not None:
+                scores = scores + attn_mask.permute(1, 0, 2, 3).to(scores.dtype)
             # scores = self._apply_causal_mask(scores)
             pattern = F.softmax(scores, dim=-1)
             # print(f'{pattern = }')

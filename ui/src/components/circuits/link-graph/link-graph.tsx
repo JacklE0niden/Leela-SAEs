@@ -22,7 +22,7 @@ interface LinkGraphProps {
   visState: VisState;
   onNodeClick: (nodeId: string, metaKey: boolean) => void;
   onNodeHover: (nodeId: string | null) => void;
-  hideEmbLogit?: boolean; // Whether to hide Emb and Logit layers (for interaction circuit mode)
+  hideEmbLogit?: boolean; // Whether to hide Emb and Logit boundary layers
 }
 
 const LinkGraphComponent: React.FC<LinkGraphProps> = ({
@@ -229,7 +229,7 @@ const LinkGraphComponent: React.FC<LinkGraphProps> = ({
         onClick={(event) => {
           // Only clear selection if clicking on the SVG background (not on nodes)
           if (event.target === event.currentTarget) {
-            console.log("[LinkGraph] SVG 背景点击，清除选中");
+            console.log("[LinkGraph] SVG background clicked, clearing selection");
             onNodeClick("", false);
           }
         }}

@@ -21,19 +21,12 @@ import torch.nn.functional as F
 import torch.nn as nn
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-
 # -----------------------------
-# User-editable default paths
+# default paths
 # -----------------------------
 
-# Prefer setting this file under a repo-local folder so the path is anonymous and reproducible.
-# Put your ONNX file here:
-#   models/lc0/BT4-1024x15x32h-swa-6147500.onnx
-DEFAULT_ONNX_PATH = REPO_ROOT / "BT4-1024x15x32h-swa-6147500.onnx"
-
-# Output checkpoint (used by TransformerLens/transformer_lens/loading_from_pretrained.py with Project_root=/path/to/models)
-DEFAULT_OUTPUT_PT = REPO_ROOT / "/path/to/models/lc0/BT4.pt"
+DEFAULT_ONNX_PATH = "BT4-1024x15x32h-swa-6147500.onnx"
+DEFAULT_OUTPUT_PT = "/path/to/models/lc0/BT4.pt"
 
 
 def _require_onnx_deps() -> tuple[object, object]:

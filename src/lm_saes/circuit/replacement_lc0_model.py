@@ -36,7 +36,7 @@ class ReplacementAttention(nn.Module):
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.hook_in(x)
-        # 调用原始的MultiHeadAttention，它现在返回完整的attn_out
+        # Call the original MultiHeadAttention, which now returns the full attn_out
         attn_out = self.old_mha(x)
         return self.hook_out(attn_out)
 
@@ -49,33 +49,33 @@ class ReplacementPolicyHead(nn.Module):
         self.hook_pre = HookPoint()
         self.hook_post = HookPoint()
         
-        # 为Q和K添加hook points
+        # Add hook points for Q and K
         self.hook_q = HookPoint()
         self.hook_k = HookPoint()
 
     def forward(self, x):
         x = self.hook_pre(x)
         
-        # 手动实现PolicyHead的前向传播，在Q和K处添加hooks
-        # Dense1层
+        # Manually implement the PolicyHead forward pass and add hooks at Q and K
+        # Dense1 layer
         x = self.old_policy_head.dense1(x)
         x = self.old_policy_head.mish(x)
         
-        # Q和K投影，并添加hooks
+        # Project Q and K and add hooks
         q = self.old_policy_head.q_proj(x)
         k = self.old_policy_head.k_proj(x)
         
-        # 通过hook points
+        # Pass through hook points
         q = self.hook_q(q)
         k = self.hook_k(k)
         
-        # 计算注意力分数
+        # Compute attention scores
         scores = self.old_policy_head.hook_policy_qk_score(
             torch.matmul(q, k.transpose(-2, -1))
         )
         scores = scores * self.old_policy_head.scale
         
-        # Promotion 计算
+        # Compute promotion logits
         promotion_slice = k[:, 56:64, :]
         promotion_out = self.old_policy_head.promotion(promotion_slice)
         
@@ -97,7 +97,7 @@ class ReplacementPolicyHead(nn.Module):
         promotion = promotion_out2 + promotion_out
         promotion = promotion.reshape(-1, 3, 64)
         
-        # 组合policy
+        # Combine the policy outputs
         policy = torch.cat([scores, promotion], dim=1)
         policy = policy.reshape(-1, 4288)
         
@@ -326,14 +326,14 @@ class ReplacementModel(HookedTransformer):
             )
 
     def _configure_skip_connection(self, block, layer):
-        """为指定层配置skip connection - 基于原始replacement_model.py"""
+        """Configure skip connections for a given layer, based on the original replacement_model.py."""
         
         def add_skip_connection(acts: torch.Tensor, hook: HookPoint, grad_hook: HookPoint, replacement_bias: torch.Tensor):
-            # 和原始代码一样的逻辑
+            # Same logic as the original code
             assert replacement_bias.requires_grad, "Replacement bias must be a parameter"
             return grad_hook((acts - replacement_bias).detach() + replacement_bias)
 
-        # 为MLP输出添加hook和特殊的grad hook（类似原始代码）
+        # Add hooks and special gradient hooks for the MLP output, similar to the original code
         output_hook_parts = self.original_mlp_output_hook.split(".")
         subblock = block
         for part in output_hook_parts:
@@ -405,7 +405,7 @@ class ReplacementModel(HookedTransformer):
         ]
         print("init activation_hooks")
         def cache_activations_mlp(acts, hook, layer, zero_bos):
-            # 使用individual SAE而不是CrossLayerTranscoder
+            # Use individual SAEs instead of CrossLayerTranscoder
             transcoder_acts = self.transcoders[str(layer)].encode(
                 acts,
                 return_hidden_pre=not apply_activation_function
@@ -443,10 +443,10 @@ class ReplacementModel(HookedTransformer):
         sparse: bool = False,
         zero_bos: bool = False,
         apply_activation_function: bool = True,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:  # 修正返回类型
-        """获取transcoder激活 - 类似原始代码但简化版"""
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:  # Correct return type
+        """Get transcoder activations, similar to the original code but simplified."""
         
-        activation_cache, lorsa_attention_pattern, activation_hooks = self._get_activation_caching_hooks(  # 修正解包
+        activation_cache, lorsa_attention_pattern, activation_hooks = self._get_activation_caching_hooks(  # Correct unpacking
             sparse=sparse,
             zero_bos=zero_bos,
             apply_activation_function=apply_activation_function,
@@ -486,7 +486,7 @@ class ReplacementModel(HookedTransformer):
             lambda name: self.mlp_output_hook in name
         )
         
-        # 添加policy head q和k的缓存hooks（如果policy_head存在）
+        # Add cache hooks for policy-head Q and K if policy_head exists
         policy_cache = {}
         policy_caching_hooks = []
         if hasattr(self, 'policy_head'):
@@ -505,7 +505,7 @@ class ReplacementModel(HookedTransformer):
         all_hooks = activation_hooks + attn_out_caching_hooks + mlp_out_caching_hooks + policy_caching_hooks
         logits = self.run_with_hooks(tokens, fwd_hooks=all_hooks)
         
-        # 缓存policy head的q和k activations到模型属性中
+        # Cache policy-head Q and K activations on the model
         if hasattr(self, 'policy_head'):
             for hook_name, cached_value in policy_cache.items():
                 if "hook_q" in hook_name:
@@ -536,7 +536,7 @@ class ReplacementModel(HookedTransformer):
             if isinstance(layer_act, torch.Tensor) and layer_act.layout == torch.sparse_coo:
                 layer_act = layer_act.to_dense()
 
-            # ↓ 如果后面还需要在 decode 前 reshape，方便你继续加逻辑
+            # If you still need to reshape before decode later, this keeps that path easy to extend
             # if layer_act.ndim == 4:
             #     layer_act = layer_act.reshape(layer_act.shape[0], layer_act.shape[1], -1)
 
@@ -569,21 +569,21 @@ class ReplacementModel(HookedTransformer):
             lorsa_activation_matrix = lorsa_activation_matrix.coalesce()
             tc_activation_matrix = tc_activation_matrix.coalesce()
 
-        # 从hook_embed获取实际的embedding值
+        # Get the actual embedding values from hook_embed
         with torch.no_grad():
-            # 运行前向传播获取embedding
+            # Run a forward pass to obtain embeddings
             _, cache = self.run_with_cache(tokens, prepend_bos=False)
-            token_vectors = cache['hook_embed'].detach()  # 形状: [batch, seq_len, d_model]
-            # 如果是batch维度，取第一个batch
+            token_vectors = cache['hook_embed'].detach()  # Shape: [batch, seq_len, d_model]
+            # If there is a batch dimension, take the first batch
             if token_vectors.dim() == 3:
-                token_vectors = token_vectors[0]  # 形状: [seq_len, d_model]
+                token_vectors = token_vectors[0]  # Shape: [seq_len, d_model]
 
         return logits, lorsa_activation_matrix, lorsa_attention_pattern, tc_activation_matrix, error_vectors, token_vectors
 
     def setup_intervention_with_freeze(
         self, inputs: Union[str, torch.Tensor], direct_effects: bool = False
     ) -> List[Tuple[str, Callable]]:
-        """设置干预和冻结 - 简化版，只处理MLP相关"""
+        """Set interventions and freezing behavior. Simplified version handling only MLP-related paths."""
         
         if direct_effects:
             hookpoints_to_freeze = ["hook_pattern", "hook_scale", self.feature_output_hook]
@@ -598,7 +598,7 @@ class ReplacementModel(HookedTransformer):
         def freeze_hook(activations, hook):
             cached_values = freeze_cache[hook.name]
 
-            # 处理序列长度不匹配的情况
+            # Handle mismatched sequence lengths
             if "hook_pattern" in hook.name and activations.shape[2:] != cached_values.shape[2:]:
                 new_activations = activations.clone()
                 new_activations[:, :, : cached_values.shape[2], : cached_values.shape[3]] = (
@@ -638,14 +638,14 @@ class ReplacementModel(HookedTransformer):
         freeze_attention: bool = True,
         apply_activation_function: bool = True,
     ):
-        """获取特征干预hooks - 简化版，只处理MLP"""
+        """Get feature intervention hooks. Simplified version handling only MLP paths."""
         
         from collections import defaultdict
         interventions_by_layer = defaultdict(list)
         for layer, pos, feature_idx, value in interventions:
             interventions_by_layer[layer].append((pos, feature_idx, value))
 
-        # 激活缓存
+        # Activation cache
         activation_cache, lorsa_attention_pattern, activation_hooks = self._get_activation_caching_hooks(
             apply_activation_function=apply_activation_function
         )
@@ -675,7 +675,7 @@ class ReplacementModel(HookedTransformer):
 
         all_hooks = (
             self.setup_intervention_with_freeze(inputs, direct_effects=direct_effects)
-            if direct_effects  # 不需要freeze_attention了
+            if direct_effects  # freeze_attention is no longer needed
             else []
         )
         all_hooks += activation_hooks + intervention_hooks
@@ -693,7 +693,7 @@ class ReplacementModel(HookedTransformer):
         freeze_attention: bool = True,
         apply_activation_function: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """特征干预 - 简化版，只处理MLP"""
+        """Feature intervention. Simplified version handling only MLP paths."""
         
         feature_intervention_hook_output = self._get_feature_intervention_hooks(
             inputs,
@@ -713,7 +713,7 @@ class ReplacementModel(HookedTransformer):
         return logits, activation_cache
 
     # def _get_requires_grad_bias_params(self):
-    #     """获取需要梯度的bias参数 - 类似原始代码但简化"""
+    #     """Get bias parameters that require gradients, similar to the original code but simplified."""
     #     bias_params = []
     #     for param in self.named_parameters():
     #         if ('.b' in param[0] and 

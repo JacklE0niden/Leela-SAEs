@@ -5,16 +5,17 @@ This repository contains the code for experiments and analyses in **Tracing the 
 ## Example: Reasoning Pathway of a Grandmaster-Level Movement by BT4
 
 <p align="center">
-  <img src="figures/superhuman.svg" alt="Superhuman performance" width="700" />
+  <img src="figures/example.svg" alt="Superhuman performance" width="700" />
 </p>
 
-**Key insights from the reasoning pathway:**
+**Interpretation of the reasoning pathway shown in the figure:**
 
-- Protected by the pawn on d4  
-- Combines with Qf7+ to create a mating threat  
-- Supports the development of Bg2  
-- Prevents ...Bb7 attacking the knight  
-- Anticipates the opponent response Qe7
+- e5 is identified as protected by the pawn on d4
+- Ne5 interacts with the Qf7+ threat to create mating pressure
+- Ne5 supports subsequent Bg2 development
+- After Ne5, the ...Bb7 diagonal no longer attacks the knight
+- The pathway reflects anticipation of the response Qe7
+- We find features encoding files where an own rook/queen is blocked by a pawn, but becomes exposed to threaten the opponent king/queen after a diagonal pawn capture. They serve to open up a file for the rook/queen.
 
 
 ## Download the BT4 model and convert weights
@@ -90,18 +91,24 @@ python examples/train_tc_BT4.py
 The reasoning-pathway generation entrypoint is:
 
 ```bash
-python src/path_generation/generate_pathway.py
+python examples/generate_reasoning_pathway.py
 ```
 
 ### 4) Launch an Experiment
-Explore the examples to check the basic usage of training/analyzing SAEs in different configurations. Note a MongoDB is recommended for recording the model/dataset/SAE configurations and required for storing analyses. For more advanced usage, you may explore src/lm_saes/runners folder for the interface for generating activations and training & analyzing SAE variants, and directly write your own variant of training/analyzing script at the runner level.
+Explore the examples to check the basic usage of training/analyzing SAEs in different configurations. Note a MongoDB is recommended for recording the model/dataset/SAE configurations and for storing analyses. For more advanced usage, you may explore src/lm_saes/runners folder for the interface for generating activations and training & analyzing SAE variants, and directly write your own variant of training/analyzing script at the runner level.
 
-Visualizing the Learned Dictionary
-The analysis results will be saved using MongoDB, and you can use the provided visualization tools to visualize the learned dictionary. First, start the FastAPI server by running the following command:
+### Visualizing learned dictionaries and reasoning pathways
 
-uvicorn server.app:app --port 24577 --env-file server/.env
-Then, copy the ui/.env.example file to ui/.env and modify the BACKEND_URL to fit your server settings (by default, it's http://localhost:24577), and start the frontend by running the following command:
+Analysis results are stored in **MongoDB**. You can browse learned dictionary and related analyses in WebUI frontend. The frontend also includes a page where you can **upload reasoning-pathway CSV files** to inspect reasoning pathways interactively. Start the FastAPI backend with:
 
+```bash
+uv run uvicorn server.app:app --host 0.0.0.0 --port 3000 --env-file server/.env
+```
+Then, copy the ui/.env.example file to ui/.env and modify the BACKEND_URL to fit your server settings, and start the frontend by running the following command:
+
+```bash
 cd ui
-bun dev --port 24576
-That's it! You can now go to http://localhost:24576 to visualize the learned dictionary and its features.
+bun dev --port 5173
+```
+
+That's it! You can now go to http://localhost:5173 to visualize the learned dictionary and its features.

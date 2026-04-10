@@ -500,7 +500,7 @@ def _process_sae_features_batch(mongo_client, sae_features, result):
                 context_idx_to_fen.update(shard_results)
     except Exception as e:
         print(f"multi-thread load failed, fall back to sequential load: {e}")
-        # 回退到顺序加载
+        # Fall back to sequential loading
         for shard_info in tqdm(shard_groups.items(), desc="sequential load shards"):
             shard_results = load_single_shard(shard_info)
             context_idx_to_fen.update(shard_results)
@@ -573,7 +573,7 @@ def _process_sae_features_batch(mongo_client, sae_features, result):
     try:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [executor.submit(generate_fen_list, feature_info) for feature_info in feature_to_contexts.items()]
-            for i, future in enumerate(tqdm(as_completed(futures), total=len(futures), desc="生成FEN列表")):
+            for i, future in enumerate(tqdm(as_completed(futures), total=len(futures), desc="Generate FEN lists")):
                 key, fen_list = future.result()
                 result[key] = fen_list
 

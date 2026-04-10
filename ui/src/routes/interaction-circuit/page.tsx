@@ -747,7 +747,7 @@ export const InteractionCircuitPage = () => {
     []
   );
 
-  // Parse Top Activation data (consistent with circuit-visualization.tsx)
+  // Parse Top Activation data for the interaction graph view
   const parseTopActivationData = useCallback((camelData: any): TopActivationSample[] => {
     const sampleGroups = camelData?.sampleGroups || camelData?.sample_groups || [];
     const allSamples: any[] = [];
@@ -1130,7 +1130,7 @@ export const InteractionCircuitPage = () => {
     // Kept for API compatibility
   }, []);
 
-  // Handle node hover (same semantics as circuit-visualization.tsx)
+  // Handle node hover in the interaction graph view
   // Only update if the hovered ID has actually changed
   // This prevents unnecessary re-renders and keeps hoveredId stable
   const handleNodeHover = useCallback((nodeId: string | null) => {

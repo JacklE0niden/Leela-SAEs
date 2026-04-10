@@ -58,7 +58,7 @@ def compute_decoder_cos_sim_single(
 
     if layer1 != layer2:
         if layer1 < layer2:
-            # 将 dec_vec1 从 layer1 的 feature_type1 位置传播到 layer2 的 feature_type2 位置
+            # Propagate dec_vec1 from feature_type1 at layer1 to feature_type2 at layer2
             dec_vec1 = apply_layernorm_path_with_feature_types(
                 dec_vec1,
                 src_layer=layer1,
@@ -67,7 +67,7 @@ def compute_decoder_cos_sim_single(
                 tgt_feature_type=feature_type2,
             )
         else:
-            # 将 dec_vec2 从 layer2 的 feature_type2 位置传播到 layer1 的 feature_type1 位置
+            # Propagate dec_vec2 from feature_type2 at layer2 to feature_type1 at layer1
             dec_vec2 = apply_layernorm_path_with_feature_types(
                 dec_vec2,
                 src_layer=layer2,

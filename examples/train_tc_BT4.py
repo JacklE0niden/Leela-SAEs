@@ -117,7 +117,7 @@ if __name__ == "__main__":
             ignore_token_ids=[],
         ),
         sae_name=f"BT4_tc_L{l}M_k{args.k}_e{exp_factor}",
-        sae_series="BT4-exp128",
+        sae_series="BT4",
         model_parallel_size=args.tp,
         data_parallel_size=args.dp,
     )

@@ -357,7 +357,7 @@ class HookedTransformer(HookedRootModule):
         """
         if isinstance(input, str) or isinstance(input, list):
             # If text, convert to tokens (batch_size=1)
-            # 输入是一个字符串，要先经过tokenizer一下
+            # Input is a string, so run it through the tokenizer first
             # tokens = self.tokenizer(input)
             if not self.cfg.is_leela_chess_model:
                 assert (

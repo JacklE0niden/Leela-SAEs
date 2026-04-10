@@ -3,9 +3,9 @@ import os
 from abc import ABC, abstractmethod
 from pathlib import Path
 
-# 安全地获取包版本
+# Safely get the package version
 def _get_package_version(package_name: str, default: str = "unknown") -> str:
-    """安全地获取包版本，如果失败则返回默认值"""
+    """Safely get a package version, returning the default on failure."""
     try:
         from importlib.metadata import version
         return version(package_name)
@@ -137,7 +137,7 @@ class AbstractSparseAutoEncoder(HookedRootModule, ABC):
         }
         """
         state_dict = self.full_state_dict()
-        # 安全地获取版本号（仅在保存 .safetensors 或 .pt 时需要）
+        # Safely get the version string (only needed when saving .safetensors or .pt files)
         sae_version = _get_package_version("lm-saes", default="unknown")
         
         if Path(ckpt_path).suffix == ".safetensors":

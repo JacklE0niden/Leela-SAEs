@@ -29,7 +29,7 @@ export const YAxis: React.FC<YAxisProps> = React.memo(({
       
       let label: string;
       if (hideEmbLogit) {
-        // Interaction circuit mode: remove Emb and Logit, calculate directly from layerIdx: A0/M0 start from layerIdx 0/1
+        // Compact interaction labels: A0/M0 start from layerIdx 0/1
         // layerIdx % 2 === 0 means A layer, otherwise M layer
         // A0=0, M0=1, A1=2, M1=3, A2=4, M2=5, ...
         if (layerIdx % 2 === 0) {
@@ -40,7 +40,7 @@ export const YAxis: React.FC<YAxisProps> = React.memo(({
           label = `M${Math.floor(layerIdx / 2)}`;
         }
       } else {
-        // Circuit tracing mode: keep Emb and Logit
+        // Full layer labels: keep Emb and Logit
       if (layerIdx === 0) {
         label = "Emb";
       } else if (layerIdx === yNumTicks - 1) {

@@ -6,41 +6,41 @@ import einops
 
 def convert_leela_weights(load_dict, cfg: HookedTransformerConfig):
     """
-    将LC0象棋模型的权重转换为TransformerLens格式
+    Convert LC0 chess model weights to TransformerLens format
     
     Args:
-        load_dict: LC0模型的原始权重字典
-        cfg: TransformerLens配置对象
+        load_dict: raw weight dictionary from the LC0 model
+        cfg: TransformerLens config object
         
     Returns:
-        state_dict: 转换后的权重字典
+        state_dict: converted weight dictionary
     """
     state_dict = {}
     
-    # 1. 转换 attention_body -> embed（保留原参数名）
+    # 1. Convert attention_body -> embed (keep original parameter names)
     for key, value in load_dict.items():
         if key.startswith('attention_body.'):
-            # 提取相对路径（去掉attention_body.前缀）
+            # Extract the relative path (remove the attention_body. prefix)
             relative_path = key[len('attention_body.'):]
-            # 使用embed.前缀
+            # Use the embed. prefix
             new_key = f'embed.{relative_path}'
             state_dict[new_key] = value
     
-    # 2. 转换 encoders -> blocks（保留所有原参数名）
+    # 2. Convert encoders -> blocks (keep all original parameter names)
     for key, value in load_dict.items():
         if key.startswith('encoders.'):
-            # 将 encoders.X. 替换为 blocks.X.
+            # Replace encoders.X. with blocks.X.
             new_key = key.replace('encoders.', 'blocks.', 1)
             state_dict[new_key] = value
     # for key, value in load_dict.items():
     #     if key.startswith('encoders.'):
     #         new_key = key.replace('encoders.', 'blocks.', 1)
-    #         # 只对blocks.0.mha.hook_q转置
+    #         # Only transpose blocks.0.mha.hook_q
     #         if new_key.endswith('q_proj.weight'):
     #             state_dict[new_key] = value.T
     #         else:
     #             state_dict[new_key] = value
-    # 3. 保持其他头部不变 (policy_head, value_head, mlh_head)
+    # 3. Keep other heads unchanged (policy_head, value_head, mlh_head)
     for key, value in load_dict.items():
         if key.startswith(('policy_head.', 'value_head.', 'mlh_head.')):
             state_dict[key] = value

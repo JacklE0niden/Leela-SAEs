@@ -51,8 +51,8 @@ if __name__ == "__main__":
             },
             non_activating_subsample=None,
         ),
-        sae_name=f"BT4_tc_L{layer}M_k{args.k}_e{args.exp_factor}_seed7",
-        sae_series="BT4-exp128",
+        sae_name=f"BT4_tc_L{layer}M_k{args.k}_e{args.exp_factor}",
+        sae_series="BT4",
         activation_factory=ActivationFactoryConfig(
             sources=[
                 ActivationFactoryActivationsSource(

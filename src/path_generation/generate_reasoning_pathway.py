@@ -12,10 +12,6 @@ from lm_saes import LowRankSparseAttention, SparseAutoEncoder
 from tqdm.auto import tqdm
 from transformer_lens import HookedTransformer
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.append(str(PROJECT_ROOT))
-
 from src.chess_utils import get_move_from_policy_output_with_prob
 from src.feature_and_steering import analyze_position_features_comprehensive
 from src.path_evaluation.feature_infl import (
@@ -27,8 +23,8 @@ from src.path_evaluation.feature_infl import (
 
 DEFAULT_MODEL_NAME = "lc0/BT4-1024x15x32h"
 DEFAULT_DEVICE = "cuda"
-DEFAULT_TC_ROOT = PROJECT_ROOT / "result_BT4" / "tc" / "k_30_e_16"
-DEFAULT_LORSA_ROOT = PROJECT_ROOT / "result_BT4" / "lorsa" / "k_30_e_16"
+DEFAULT_TC_ROOT = "/path/to/tc"
+DEFAULT_LORSA_ROOT = "/path/to/lorsa"
 
 INTERACTION_COLUMNS = [
     "source_layer",
@@ -349,7 +345,7 @@ def compute_self_interaction_frame(
     feature_table: pd.DataFrame,
     precomputed_data: dict[str, Any],
     steering_factor: float = 0.0,
-    reduction_ratio: float = 0.1,
+    reduction_ratio: float = 0.2,
 ) -> pd.DataFrame:
     unique_features = _unique_feature_frame(feature_table)
     feature_list = build_feature_list_from_df(unique_features)
@@ -375,7 +371,7 @@ def compute_cross_interaction_frame(
     target_feature_table: pd.DataFrame,
     precomputed_data: dict[str, Any],
     steering_factor: float = 0.0,
-    reduction_ratio: float = 0.1,
+    reduction_ratio: float = 0.2,
 ) -> pd.DataFrame:
     source_features = build_feature_list_from_df(_unique_feature_frame(source_feature_table))
     target_features = build_feature_list_from_df(_unique_feature_frame(target_feature_table))
@@ -498,7 +494,7 @@ def generate_path_csvs(
     output_dir: str | Path,
     top_k_moves: int = 1,
     n_features: int = 200,
-    reduction_ratio: float = 0.1,
+    reduction_ratio: float = 0.2,
     steering_factor: float = 0.0,
     activation_threshold: float = 0.0,
     max_features_per_type: Optional[int] = None,
@@ -577,7 +573,7 @@ def generate_path_csvs(
             steering_factor=steering_factor,
             reduction_ratio=reduction_ratio,
         )
-        output_csv = fen_output_dir / f"{move}_{move}_reduction_{reduction_ratio}.csv"
+        output_csv = fen_output_dir / f"{move}_reduction_{reduction_ratio}.csv"
         generated_csvs[f"{move}_{move}"] = write_interaction_csv_with_metadata(
             output_csv=output_csv,
             interaction_frame=interaction_frame,
