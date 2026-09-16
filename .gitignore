@@ -131,6 +131,9 @@ celerybeat.pid
 # Environments
 .env
 .venv
+
+# Circuit tracing runtime results
+circuit_trace_results/
 env/
 venv/
 ENV/

@@ -2,6 +2,7 @@ import math
 import torch
 import os
 import argparse
+from pathlib import Path
 from lm_saes import (
     ActivationFactoryActivationsSource,
     ActivationFactoryConfig,
@@ -26,6 +27,7 @@ def parse_args():
 
 
 if __name__ == "__main__":
+    repo_root = Path(__file__).resolve().parents[1]
     # Build the evaluation settings
     timer.enable()
     args = parse_args()
@@ -35,7 +37,7 @@ if __name__ == "__main__":
     hook_point_out = f"blocks.{args.layer}.hook_mlp_out"
     
     cfg = SAEConfig.from_pretrained(
-        f'/path/to/tc/L{layer}',
+        str(repo_root / "result_BT4" / "tc" / f"L{layer}"),
         device="cuda",
         dtype=torch.float32,
     )
@@ -48,7 +50,7 @@ if __name__ == "__main__":
                 ActivationFactoryActivationsSource(
                     name='master',
                     path=os.path.expanduser(
-                        "/path/to/activations"
+                        str(repo_root / "activations")
                     ),
                     device="cuda",
                     dtype=torch.float32,
@@ -72,4 +74,4 @@ if __name__ == "__main__":
         device_type="cuda",
     )
 
-    evaluate_sae(settings) 
+    evaluate_sae(settings)

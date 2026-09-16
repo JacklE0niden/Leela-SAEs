@@ -194,6 +194,11 @@ class HookedTransformerConfig:
             Defaults to 8.0.
         use_post_qk_ln (bool): Whether to apply layer normalization after the query and key
             transformations in the attention mechanism. Defaults to False.
+        is_chess_model (bool): Whether the model is a chess model. Defaults to False.
+        possible_moves (int *optional*): The number of possible moves in the chess model. Defaults to None
+            for a general model.
+        num_return_buckets (int *optional*): The number of buckets for searchless-chess model. Defaults to None.
+        shift_right (bool): Whether to shift the input sequences right(for searchless-chess model). Defaults to False.
         is_leela_chess_model (bool): Whether the model is a leela chess model. Defaults to False.
     """
 
@@ -265,6 +270,10 @@ class HookedTransformerConfig:
     NTK_by_parts_factor: float = 8.0
     old_context_len: Optional[int] = None
     use_post_qk_ln: bool = False
+    is_chess_model: bool = False
+    possible_moves: Optional[int] = None
+    num_return_buckets: Optional[int] = None
+    shift_right: bool = False
     is_leela_chess_model: bool = False
     # newly added
     leela_embed: Optional[str] = None
@@ -272,7 +281,7 @@ class HookedTransformerConfig:
     leela_resid_alpha: Optional[str] = None
     d_value_head: Optional[int] = None
     d_mlh_head: Optional[int] = None
-    
+
     def __post_init__(self):
         if self.n_heads == -1:
             self.n_heads = self.d_model // self.d_head
@@ -346,6 +355,9 @@ class HookedTransformerConfig:
 
         if self.use_attn_scale and self.attn_scale == -1.0:
             self.attn_scale = np.sqrt(self.d_head)
+
+        # if self.is_chess_model :
+        #     assert self.possible_moves is not None, "possible_moves must be set for chess models"
 
         assert self.default_prepend_bos in [
             True,

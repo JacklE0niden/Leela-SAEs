@@ -12,6 +12,8 @@ interface ChessBoardProps {
   size?: 'small' | 'medium' | 'large';
   showCoordinates?: boolean;
   move?: string; // UCI move string, e.g. "a2a4"
+  highlightSquares?: string[]; // board squares to highlight without showing activation values, e.g. ["h8"]
+  highlightColor?: string;
   orientation?: 'white' | 'black' | 'auto';
   flip_activation?: boolean; // whether to flip activation index by row
   onMove?: (move: string) => void;
@@ -98,15 +100,18 @@ const getSquareIndex = (row: number, col: number): number => {
   return row * 8 + col;
 };
 
-// Color for activation strength
-const getActivationColor = (activation: number): string => {
+// Color for activation strength, scaled relative to the board's activation range.
+const getActivationColor = (activation: number, maxActivation: number): string => {
   if (activation === 0) return 'transparent';
-  
-  // Use red for activation, opacity by strength
-  const intensity = Math.min(Math.abs(activation), 1);
-  const opacity = Math.max(0.4, intensity);
-  
-  return `rgba(239, 68, 68, ${opacity})`; // Red for activation
+
+  const safeMaxActivation = Math.max(maxActivation, Number.EPSILON);
+  const normalized = Math.min(Math.abs(activation) / safeMaxActivation, 1);
+
+  // Use a gentle curve so mid-range activations separate more clearly.
+  const easedIntensity = Math.pow(normalized, 0.65);
+  const opacity = 0.08 + easedIntensity * 0.84;
+
+  return `rgba(239, 68, 68, ${opacity})`;
 };
 
 /**
@@ -161,6 +166,22 @@ const getZPatternTargets = (sourceSquare: number, zPatternIndices?: number[][], 
     .slice(0, 8);
 };
 
+const getZPatternSourceSquares = (zPatternIndices?: number[][], zPatternValues?: number[]) => {
+  const sources = new Set<number>();
+  if (!zPatternIndices || !zPatternValues) return sources;
+
+  const looksLikePairList = Array.isArray(zPatternIndices[0]) && (zPatternIndices[0] as number[]).length === 2;
+  if (looksLikePairList) {
+    for (const pair of zPatternIndices) {
+      if (Array.isArray(pair) && pair.length >= 2) sources.add(Number(pair[0]));
+    }
+  } else if (zPatternIndices.length >= 2) {
+    const sourceList = zPatternIndices[0] as number[];
+    for (const source of sourceList) sources.add(Number(source));
+  }
+  return sources;
+};
+
 // Parse chess move string
 const parseMove = (move: string) => {
   if (!move || move.length < 4) return null;
@@ -198,6 +219,8 @@ export const ChessBoard: React.FC<ChessBoardProps> = ({
   size = 'medium',
   showCoordinates = true,
   move,
+  highlightSquares = [],
+  highlightColor = 'rgba(250, 204, 21, 0.72)',
   flip_activation = true,
   onMove,
   onSquareClick,
@@ -421,6 +444,11 @@ export const ChessBoard: React.FC<ChessBoardProps> = ({
     return move ? parseMove(move) : null;
   }, [move]);
 
+  const maxAbsActivation = useMemo(() => {
+    if (!activations?.length) return 0;
+    return activations.reduce((max, value) => Math.max(max, Math.abs(value)), 0);
+  }, [activations]);
+
   // Display position -> actual square index (flip + mirror)
   const getActualSquareIndex = (displayRow: number, col: number): number => {
     const actualRow = flip ? (7 - displayRow) : displayRow;
@@ -521,6 +549,7 @@ export const ChessBoard: React.FC<ChessBoardProps> = ({
 
   // Z-pattern targets for hovered square
   const zPatternTargets = hoveredSquare !== null ? getZPatternTargets(hoveredSquare, zPatternIndices, zPatternValues) : [];
+  const zPatternSourceSquares = getZPatternSourceSquares(zPatternIndices, zPatternValues);
 
   // Forward inference moves for arrows
   const forwardMoves = useMemo(() => {
@@ -574,13 +603,16 @@ export const ChessBoard: React.FC<ChessBoardProps> = ({
               const squareIndex = getActualSquareIndex(displayRowIndex, colIndex);
               const activationIndex = getActivationIndex(displayRowIndex, colIndex);
               const activation = activations?.[activationIndex] || 0;
-              const activationColor = getActivationColor(activation);
+              const activationColor = getActivationColor(activation, maxAbsActivation);
+              const hasZPatternSource = zPatternSourceSquares.has(activationIndex);
               
               const isZPatternTarget = zPatternTargets.some(target => target.square === activationIndex);
               const targetStrength = zPatternTargets.find(target => target.square === activationIndex)?.strength || 0;
               
               const isMoveFromSquare = parsedMove && parsedMove.from.index === squareIndex;
               const isMoveToSquare = parsedMove && parsedMove.to.index === squareIndex;
+              const displaySquareName = `${getDisplayColLetter(colIndex)}${getDisplayRowNumber(displayRowIndex)}`;
+              const isHighlightedSquare = highlightSquares.includes(displaySquareName);
               
               const isSelectedSquare = selectedSquare === activationIndex;
               
@@ -591,6 +623,8 @@ export const ChessBoard: React.FC<ChessBoardProps> = ({
               
               if (isSelectedSquare) {
                 finalBackgroundColor = 'rgba(59, 130, 246, 0.8)';
+              } else if (isHighlightedSquare) {
+                finalBackgroundColor = highlightColor;
               } else if (isMoveFromSquare) {
                 finalBackgroundColor = (moveColor || 'rgba(34, 197, 94, 0.7)');
               } else if (isMoveToSquare) {
@@ -617,7 +651,7 @@ export const ChessBoard: React.FC<ChessBoardProps> = ({
                     relative flex items-center justify-center
                     ${baseColor}
                     transition-all duration-200 hover:brightness-110
-                    ${activation !== 0 ? 'cursor-pointer' : ''}
+                    ${activation !== 0 || hasZPatternSource ? 'cursor-pointer' : ''}
                     ${isInteractive ? 'cursor-pointer' : ''}
                     ${isSelectedSquare ? 'ring-2 ring-blue-500 ring-opacity-75' : ''}
                   `}
@@ -625,7 +659,7 @@ export const ChessBoard: React.FC<ChessBoardProps> = ({
                     backgroundColor: finalBackgroundColor,
                   }}
                   onMouseEnter={() => {
-                    if (activation !== 0) {
+                    if (activation !== 0 || hasZPatternSource) {
                       setHoveredSquare(activationIndex);
                     }
                   }}

@@ -125,7 +125,7 @@ settings = TrainSAESettings(
 
 ```bash
 uv run torchrun --nproc-per-node=4 examples/analyze_pythia_sae.py \
-    --sae_path /path/to/sae
+    --sae_path result/sae
 ```
 
 ```python

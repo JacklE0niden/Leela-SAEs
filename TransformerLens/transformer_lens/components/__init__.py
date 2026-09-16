@@ -19,7 +19,12 @@ from .unembed import Unembed
 from .attention import Attention
 from .bert_mlm_head import BertMLMHead
 from .embed import Embed
+from .chessformer_embed import ChessFormerEmbed
+from .searchless_chess_embed import SearchlessChessEmbed
 from .leela_embed import LeelaEmbed, BT4LeelaEmbed
+from .searchless_chess_tokenizer import SearchlessChessTokenizer
+from .searchless_chess_tokenizer_behavior import SearchlessChessBehavioralCloningTokenizer
+from .searchless_chess_shift_right import ShiftRight
 from .leela_features import LeelaBoard
 from .leela_encoder import EncoderLayer
 from .leela_policyhead import PolicyHead

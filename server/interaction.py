@@ -25,13 +25,13 @@ except ImportError:
     from constants import BT4_MODEL_NAME
 
 try:
-    from .sae_combo_service import get_cached_models
+    from .circuits_service import get_cached_models
 except ImportError:
     try:
-        from sae_combo_service import get_cached_models
+        from circuits_service import get_cached_models
     except ImportError:
         get_cached_models = None
-        print("WARNING: sae_combo_service not found, cached models unavailable")
+        print("WARNING: circuits_service not found, cached models unavailable")
 
 
 def analyze_node_interaction_impl(request: Dict[str, Any]) -> Dict[str, Any]:
@@ -53,7 +53,7 @@ def analyze_node_interaction_impl(request: Dict[str, Any]) -> Dict[str, Any]:
     
     Returns:
         dictionary containing the analysis results:
-            - steering_scale: steering scale used
+            - steering_scale: 使用的steering scale
             - steering_nodes_count: number of steering nodes
             - steering_details: details about each steering node
             - target_nodes: list of results for each target node
@@ -67,7 +67,7 @@ def analyze_node_interaction_impl(request: Dict[str, Any]) -> Dict[str, Any]:
     if get_cached_models is None:
         raise HTTPException(
             status_code=503,
-            detail="SAE preload service not available. Please check if sae_combo_service.py is available."
+            detail="Circuits service not available. Please check if circuits_service.py is available."
         )
     
     # extract parameters
@@ -113,12 +113,12 @@ def analyze_node_interaction_impl(request: Dict[str, Any]) -> Dict[str, Any]:
         if cached_hooked_model is None:
             raise HTTPException(
                 status_code=503,
-                detail=f"Model not loaded. Please call /sae/preload_combo first with combo_id={sae_combo_id}"
+                detail=f"Model not loaded. Please call /circuit/preload_models first with combo_id={sae_combo_id}"
             )
         if cached_transcoders is None or cached_lorsas is None:
             raise HTTPException(
                 status_code=503,
-                detail=f"Transcoders/Lorsas not loaded. Please call /sae/preload_combo first with combo_id={sae_combo_id}"
+                detail=f"Transcoders/Lorsas not loaded. Please call /circuit/preload_models first with combo_id={sae_combo_id}"
             )
         
         # check if transcoders and lorsas are complete (should have 15 layers)
@@ -137,7 +137,7 @@ def analyze_node_interaction_impl(request: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         raise HTTPException(
             status_code=503,
-            detail=f"Failed to get cached models: {str(e)}. Please call /sae/preload_combo first."
+            detail=f"Failed to get cached models: {str(e)}. Please call /circuit/preload_models first."
         )
     
     # run model and get cache

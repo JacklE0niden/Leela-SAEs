@@ -1,6 +1,7 @@
 import math
 import time
 import os
+from pathlib import Path
 
 import torch
 import numpy as np
@@ -33,6 +34,7 @@ lr=args.lr
 exp_factor=args.exp_factor
 
 if __name__ == "__main__":
+    repo_root = Path(__file__).resolve().parents[1]
     import torch.multiprocessing as mp
     mp.set_start_method('spawn', force=True)
     # seed = int(time.time())
@@ -89,7 +91,13 @@ if __name__ == "__main__":
             eval_frequency=1000000,
             n_checkpoints=0,
             check_point_save_mode="linear",
-            exp_result_path=f"/path/to/tc/L{l}",
+            exp_result_path=str(
+                repo_root
+                / "result_BT4"
+                / "tc"
+                / f"k_{args.k}_e_{exp_factor}"
+                / f"L{l}"
+            ),
         ),
         wandb=WandbConfig(
             log_to_wandb=True,
@@ -101,7 +109,7 @@ if __name__ == "__main__":
             sources=[
                 ActivationFactoryActivationsSource(
                     path=os.path.expanduser(
-                        "/path/to/activations"
+                        str(repo_root / "activations")
                     ),
                     sample_weights=1.0,
                     name="master",

@@ -6,19 +6,6 @@ from lm_saes.circuit.leela_board import LeelaBoard
 from lm_saes.database import MongoClient
 
 
-PIECE_CODES = ("p", "n", "b", "r", "q", "k")
-LEGACY_PIECE_TYPE_CATEGORY_ALIASES = {
-    **{f"my{piece_code}": f"own {piece_code}" for piece_code in PIECE_CODES},
-    **{f"opponent{piece_code}": f"opponent {piece_code}" for piece_code in PIECE_CODES},
-}
-
-
-def normalize_piece_type_category(category: Optional[str]) -> Optional[str]:
-    if category is None:
-        return None
-    return LEGACY_PIECE_TYPE_CATEGORY_ALIASES.get(category, category)
-
-
 class FeatureEntropyCalculator:
     
     def __init__(self, mongo_client: MongoClient, sae_series: str = "BT4-exp128"):
@@ -45,7 +32,7 @@ class FeatureEntropyCalculator:
     def get_piece_type_category(self, pos: int, fen: str) -> Optional[str]:
         """
         Get piece type category based on current side to move.
-        Returns one of: own p, own n, own b, own r, own q, own k, space, opponent p, opponent n, opponent b, opponent r, opponent q, opponent k
+        Returns one of: myr, myn, myb, myq, myk, myp, space, opponentr, opponentn, opponentb, opponentq, opponentk, opponentp
         """
         try:
             lboard = LeelaBoard.from_fen(fen, history_synthesis=True)
@@ -74,9 +61,9 @@ class FeatureEntropyCalculator:
             
             # Determine if piece belongs to current side
             if is_white == is_current_turn:
-                return f"own {piece_type}"
+                return f"my{piece_type}"
             else:
-                return f"opponent {piece_type}"
+                return f"opponent{piece_type}"
         except Exception:
             return None
     
@@ -154,7 +141,7 @@ class FeatureEntropyCalculator:
                     pass
             # if cannot get from pos and fen, try to get from sample directly
             if piece_type_category is None and isinstance(sample, dict):
-                piece_type_category = normalize_piece_type_category(sample.get("piece_type_category"))
+                piece_type_category = sample.get("piece_type_category")
 
             top_samples.append({
                 "rank": rank + 1,
@@ -176,7 +163,7 @@ class FeatureEntropyCalculator:
         valid_samples = 0
         
         for sample in samples:
-            category = normalize_piece_type_category(sample.get('piece_type_category'))
+            category = sample.get('piece_type_category')
             if category is not None:
                 category_counts[category] = category_counts.get(category, 0) + 1
                 valid_samples += 1

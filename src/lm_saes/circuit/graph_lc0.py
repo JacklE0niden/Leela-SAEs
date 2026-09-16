@@ -160,7 +160,9 @@ class Graph:
 
 
 def normalize_matrix(matrix: torch.Tensor) -> torch.Tensor:
-    normalized = matrix.abs()
+    # Edge storage may use BF16/FP16 during attribution. Influence propagation
+    # needs FP32 both for dtype compatibility and stable row normalization.
+    normalized = matrix.float().abs()
     return normalized / normalized.sum(dim=1, keepdim=True).clamp(min=1e-10)
 
 
@@ -170,6 +172,9 @@ def compute_influence(A: torch.Tensor, logit_weights: torch.Tensor, max_iter: in
     # But it's faster / more efficient to compute logit_weights @ A + logit_weights @ A^2
     # as follows:
 
+    if A.dtype in (torch.float16, torch.bfloat16):
+        A = A.float()
+    logit_weights = logit_weights.to(device=A.device, dtype=A.dtype)
     current_influence = logit_weights @ A
     influence = current_influence
     iterations = 0
@@ -248,7 +253,9 @@ def compute_graph_scores(graph: Graph, use_lorsa:bool=True) -> tuple[float, floa
     print(f'{n_features = }, {error_end_idx = }, {token_end_idx = }')
 
     logit_weights = torch.zeros(
-        graph.adjacency_matrix.shape[0], device=graph.adjacency_matrix.device
+        graph.adjacency_matrix.shape[0],
+        device=graph.adjacency_matrix.device,
+        dtype=torch.float32,
     )
     logit_weights[-n_logits:] = graph.logit_probabilities
 
@@ -272,6 +279,7 @@ class PruneResult(NamedTuple):
     node_mask: torch.Tensor  # Boolean tensor indicating which nodes to keep
     edge_mask: torch.Tensor  # Boolean tensor indicating which edges to keep
     cumulative_scores: torch.Tensor  # Tensor of cumulative influence scores for each node
+    node_influence: torch.Tensor  # Raw node influence before cumulative ranking
 
 
 def prune_graph(
@@ -289,6 +297,7 @@ def prune_graph(
         - node_mask: Boolean tensor indicating which nodes to keep
         - edge_mask: Boolean tensor indicating which edges to keep
         - cumulative_scores: Tensor of cumulative influence scores for each node
+        - node_influence: Raw node influence for each node
     """
 
     if node_threshold > 1.0 or node_threshold < 0.0:
@@ -302,7 +311,9 @@ def prune_graph(
     n_features = len(graph.selected_features)  # now refers to TC features only
     
     logit_weights = torch.zeros(
-        graph.adjacency_matrix.shape[0], device=graph.adjacency_matrix.device
+        graph.adjacency_matrix.shape[0],
+        device=graph.adjacency_matrix.device,
+        dtype=torch.float32,
     )
     # print(f'{logit_weights = }')
     # print(f'{n_logits = }')
@@ -351,4 +362,4 @@ def prune_graph(
     final_scores = torch.zeros_like(node_influence)
     final_scores[sorted_indices] = cumulative_scores
 
-    return PruneResult(node_mask, edge_mask, final_scores)
+    return PruneResult(node_mask, edge_mask, final_scores, node_influence)

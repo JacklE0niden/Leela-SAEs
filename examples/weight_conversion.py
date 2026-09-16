@@ -5,13 +5,14 @@ This script is a cleaned-up, runnable Python version of `examples/bt4_transfer.i
 It converts a LC0 BT4 ONNX model into a PyTorch `state_dict` checkpoint (`BT4.pt`)
 that can be loaded by the local TransformerLens fork in this repository.
 
-No CLI arguments are used. Edit the constants below if needed.
+Paths can be supplied on the command line; repository-local defaults are used otherwise.
 """
 
 # ruff: noqa: I001
 
 from __future__ import annotations
 
+import argparse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict
@@ -25,8 +26,9 @@ import torch.nn as nn
 # default paths
 # -----------------------------
 
-DEFAULT_ONNX_PATH = "BT4-1024x15x32h-swa-6147500.onnx"
-DEFAULT_OUTPUT_PT = "/path/to/models/lc0/BT4.pt"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_ONNX_PATH = REPO_ROOT / "models" / "lc0" / "BT4-1024x15x32h-swa-6147500.onnx"
+DEFAULT_OUTPUT_PT = REPO_ROOT / "models" / "lc0" / "BT4.pt"
 
 
 def _require_onnx_deps() -> tuple[object, object]:
@@ -297,7 +299,9 @@ class CleanLC0Model(nn.Module):
                     f"{encoder_prefix}.mha.smolgen.dense1.bias": f"initializers.onnx_initializer_{base_idx + 13}",
                     f"{encoder_prefix}.mha.smolgen.dense2.weight": f"initializers.onnx_initializer_{base_idx + 14}",
                     f"{encoder_prefix}.mha.smolgen.dense2.bias": f"initializers.onnx_initializer_{base_idx + 15}",
-                    f"{encoder_prefix}.mha.smolgen.smol_weight_gen.weight": f"initializers.onnx_initializer_{base_idx + 17}",
+                    f"{encoder_prefix}.mha.smolgen.smol_weight_gen.weight": (
+                        f"initializers.onnx_initializer_{base_idx + 17}"
+                    ),
                     f"{encoder_prefix}.mlp.dense1.weight": f"initializers.onnx_initializer_{base_idx + 23}",
                     f"{encoder_prefix}.mlp.dense1.bias": f"initializers.onnx_initializer_{base_idx + 24}",
                     f"{encoder_prefix}.mlp.dense2.weight": f"initializers.onnx_initializer_{base_idx + 25}",
@@ -410,7 +414,7 @@ def convert_bt4_onnx_to_pt(
     if not onnx_path.exists():
         raise FileNotFoundError(
             f"ONNX file not found: {onnx_path}\n"
-            "Place the BT4 ONNX file at the path above or edit DEFAULT_ONNX_PATH in this script."
+            "Place the BT4 ONNX file at the default path or pass --onnx-path."
         )
 
     resolved_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -429,10 +433,22 @@ def convert_bt4_onnx_to_pt(
     return output_path
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Convert a BT4 ONNX model to a PyTorch checkpoint.")
+    parser.add_argument("--onnx-path", type=Path, default=DEFAULT_ONNX_PATH)
+    parser.add_argument("--output-path", type=Path, default=DEFAULT_OUTPUT_PT)
+    parser.add_argument("--device", default=None, help="Torch device, for example cuda or cpu.")
+    return parser.parse_args()
+
+
 def main() -> None:
-    convert_bt4_onnx_to_pt()
+    args = parse_args()
+    convert_bt4_onnx_to_pt(
+        onnx_path=args.onnx_path,
+        output_path=args.output_path,
+        device=args.device,
+    )
 
 
 if __name__ == "__main__":
     main()
-

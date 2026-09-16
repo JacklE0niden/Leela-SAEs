@@ -1,7 +1,7 @@
 import { Feature, Interpretation, InterpretationSchema } from "@/types/feature";
-import { useState, useCallback, Suspense } from "react";
+import { useState, useCallback, Suspense, useEffect } from "react";
 import { Button } from "../ui/button";
-import { Ban, Check, Info, ChevronDown, ChevronRight, Copy, CheckCircle2 } from "lucide-react";
+import { Ban, Check, Info, ChevronDown, ChevronRight, Copy, CheckCircle2, CircleDashed } from "lucide-react";
 import { useAsyncFn } from "react-use";
 import { Textarea } from "../ui/textarea";
 import camelcaseKeys from "camelcase-keys";
@@ -12,10 +12,12 @@ const FeatureCustomInterpretionArea = ({
   feature,
   defaultInterpretation,
   onInterpretation,
+  onInterpretationSaved,
 }: {
   feature: Feature;
   defaultInterpretation: Interpretation | null;
   onInterpretation: (interpretation: Interpretation) => void;
+  onInterpretationSaved?: (interpretation: Interpretation) => Promise<void> | void;
 }) => {
   const [customInput, setCustomInput] = useState<string>(defaultInterpretation?.text || "");
   const [state, submit] = useAsyncFn(async () => {
@@ -40,8 +42,13 @@ const FeatureCustomInterpretionArea = ({
       .then(async (res) => await res.json())
       .then((res) => InterpretationSchema.parse(camelcaseKeys(res)));
     onInterpretation(interpretation);
+    await onInterpretationSaved?.(interpretation);
     return interpretation;
-  }, [customInput]);
+  }, [customInput, feature.dictionaryName, feature.featureIndex, onInterpretation, onInterpretationSaved]);
+
+  useEffect(() => {
+    setCustomInput(defaultInterpretation?.text || "");
+  }, [defaultInterpretation?.text, feature.dictionaryName, feature.featureIndex]);
 
   return (
     <div className="flex flex-col gap-4">
@@ -58,7 +65,13 @@ const FeatureCustomInterpretionArea = ({
   );
 };
 
-export const FeatureInterpretation = ({ feature }: { feature: Feature }) => {
+export const FeatureInterpretation = ({
+  feature,
+  onInterpretationSaved,
+}: {
+  feature: Feature;
+  onInterpretationSaved?: (interpretation: Interpretation) => Promise<void> | void;
+}) => {
   const [showCustomInput, setShowCustomInput] = useState<boolean>(false);
   const [isUserPromptExpanded, setIsUserPromptExpanded] = useState<boolean>(false);
   const [isSystemPromptExpanded, setIsSystemPromptExpanded] = useState<boolean>(false);
@@ -67,6 +80,18 @@ export const FeatureInterpretation = ({ feature }: { feature: Feature }) => {
   const [interpretation, setInterpretation] = useState<Interpretation | null>(feature.interpretation || null);
 
   const [validating, setValidating] = useState<boolean>(false);
+
+  useEffect(() => {
+    setInterpretation(feature.interpretation || null);
+  }, [feature.dictionaryName, feature.featureIndex, feature.interpretation]);
+
+  useEffect(() => {
+    setShowCustomInput(false);
+    setIsUserPromptExpanded(false);
+    setIsSystemPromptExpanded(false);
+    setExpandedValidationSections({});
+    setValidating(false);
+  }, [feature.dictionaryName, feature.featureIndex]);
 
   // Function to highlight tokens within << and >> with colored text
   const highlightTokens = useCallback((text: string): React.ReactNode => {
@@ -101,7 +126,9 @@ export const FeatureInterpretation = ({ feature }: { feature: Feature }) => {
     return <>{parts}</>;
   }, []);
 
-  const testNameMap = useCallback((method: string, passed: boolean) => {
+  const testNameMap = useCallback((method: string, passed?: boolean, status?: string) => {
+    if (status === "pending") return "Chess Rule Validation Pending";
+    if (status === "diagnostic") return "Chess Rule Diagnostic Pending";
     switch (method) {
       case "detection":
         return `Detection Test ${passed ? "Passed" : "Failed"}`;
@@ -151,8 +178,9 @@ export const FeatureInterpretation = ({ feature }: { feature: Feature }) => {
       .then((res) => InterpretationSchema.parse(camelcaseKeys(res)))
       .finally(() => setValidating(false));
     setInterpretation(interpretationValidated);
+    await onInterpretationSaved?.(interpretationValidated);
     return interpretationValidated;
-  });
+  }, [feature.dictionaryName, feature.featureIndex, onInterpretationSaved]);
 
   // Toggle validation section expand/collapse state
   const toggleValidationSection = (validationIndex: number, section: string) => {
@@ -317,12 +345,14 @@ export const FeatureInterpretation = ({ feature }: { feature: Feature }) => {
         <div className="flex flex-col gap-4 basis-1/3 min-w-1/3">
           {interpretation?.validation.map((validation, i) => (
             <div key={i} className="flex items-center gap-2">
-              {validation.passed ? (
+              {validation.status === "pending" || validation.status === "diagnostic" ? (
+                <CircleDashed size={20} className="text-amber-500" />
+              ) : validation.passed ? (
                 <Check size={20} className="text-green-500" />
               ) : (
                 <Ban size={20} className="text-red-500" />
               )}
-              <p>{testNameMap(validation.method, validation.passed)}</p>
+              <p>{testNameMap(validation.method, validation.passed, validation.status)}</p>
               {validation.detail && (
                 <HoverCard>
                   <HoverCardTrigger>
@@ -404,6 +434,7 @@ export const FeatureInterpretation = ({ feature }: { feature: Feature }) => {
         <FeatureCustomInterpretionArea
           feature={feature}
           defaultInterpretation={interpretation}
+          onInterpretationSaved={onInterpretationSaved}
           onInterpretation={(interpretation) => {
             setInterpretation(interpretation);
             setShowCustomInput(false);
@@ -452,6 +483,9 @@ export const FeatureInterpretationCard = ({
   if (!feature) {
     return null;
   }
+
+  const featureKey = `${feature.dictionaryName}:${feature.featureIndex}`;
+
   return (
     <Card>
       {title !== "" && (
@@ -461,7 +495,7 @@ export const FeatureInterpretationCard = ({
       )}
       <CardContent className={title === "" ? "pt-6" : undefined}>
         <Suspense fallback={<div>Loading Interpretation...</div>}>
-          <FeatureInterpretation feature={feature} />
+          <FeatureInterpretation key={featureKey} feature={feature} />
         </Suspense>
       </CardContent>
     </Card>

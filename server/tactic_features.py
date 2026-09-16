@@ -1,6 +1,8 @@
 import chess
 import torch
 import collections
+import os
+from pathlib import Path
 from typing import Dict, List, Tuple, Set
 from datasets import load_from_disk
 
@@ -127,7 +129,10 @@ def compute_all_diffs(
 def get_random_fens(n: int = 500, dataset_path: str = None) -> List[str]:
     """Sample random FEN strings from a dataset."""
     if dataset_path is None:
-        dataset_path = "/inspire/hdd/global_user/hezhengfu-240208120186/data/rlin_data/Chess/chess_master_data"
+        repo_root = Path(__file__).resolve().parent.parent
+        dataset_path = os.environ.get(
+            "CHESS_DATASET_PATH", str(repo_root / "data" / "chess_master_data")
+        )
     
     try:
         from datasets import load_from_disk

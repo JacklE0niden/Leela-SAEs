@@ -1,3 +1,4 @@
+import os
 from datetime import datetime
 from typing import Any, Optional
 
@@ -139,7 +140,14 @@ class CircuitAnnotationRecord(BaseModel):
 
 class MongoClient:
     def __init__(self, cfg: MongoDBConfig):
-        self.client: pymongo.MongoClient = pymongo.MongoClient(cfg.mongo_uri)
+        if os.environ.get("MONGO_MOCK", "false").lower() in {"1", "true", "yes"}:
+            import mongomock
+            from mongomock.gridfs import enable_gridfs_integration
+
+            enable_gridfs_integration()
+            self.client = mongomock.MongoClient()  # type: ignore[assignment]
+        else:
+            self.client = pymongo.MongoClient(cfg.mongo_uri)
         self.db = self.client[cfg.mongo_db]
         self.fs: gridfs.GridFS | None = None
         self.feature_collection = self.db["features"]

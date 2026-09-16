@@ -1,4 +1,3 @@
-import { AppNavbar } from "@/components/app/navbar";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
@@ -160,145 +159,142 @@ const BookmarksPage = () => {
   }
 
   return (
-    <div>
-      <AppNavbar />
-      <div className="container mx-auto p-8">
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex justify-between items-center">
-              <span>Bookmarked Features</span>
-              <span className="text-sm text-muted-foreground">
-                {totalCount} bookmark{totalCount !== 1 ? "s" : ""}
-              </span>
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="mb-6 grid grid-cols-[auto_300px_auto_300px] justify-center items-center gap-4">
-              <span className="font-bold justify-self-end">Select dictionary:</span>
-              <Combobox
-                disabled={dictionariesState.loading || loading}
-                value={selectedDictionary || null}
-                onChange={(value) => {
-                  setSelectedDictionary(value);
-                }}
-                options={dictionaryOptions}
-                placeholder="Select dictionary..."
-                commandPlaceholder="Search dictionaries..."
-                emptyIndicator="No matching dictionaries found"
-                className="w-full"
-              />
-              <span className="font-bold justify-self-end">Select analysis:</span>
-              <Select
-                disabled={analysesState.loading || !selectedDictionary || loading}
-                value={selectedAnalysis || undefined}
-                onValueChange={setSelectedAnalysis}
-              >
-                <SelectTrigger className="bg-white">
-                  <SelectValue placeholder="Select an analysis" />
-                </SelectTrigger>
-                <SelectContent>
-                  {analysesState.value?.map((analysis, i) => (
-                    <SelectItem key={i} value={analysis}>
-                      {analysis}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+    <div className="container mx-auto p-8">
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex justify-between items-center">
+            <span>Bookmarked Features</span>
+            <span className="text-sm text-muted-foreground">
+              {totalCount} bookmark{totalCount !== 1 ? "s" : ""}
+            </span>
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="mb-6 grid grid-cols-[auto_300px_auto_300px] justify-center items-center gap-4">
+            <span className="font-bold justify-self-end">Select dictionary:</span>
+            <Combobox
+              disabled={dictionariesState.loading || loading}
+              value={selectedDictionary || null}
+              onChange={(value) => {
+                setSelectedDictionary(value);
+              }}
+              options={dictionaryOptions}
+              placeholder="Select dictionary..."
+              commandPlaceholder="Search dictionaries..."
+              emptyIndicator="No matching dictionaries found"
+              className="w-full"
+            />
+            <span className="font-bold justify-self-end">Select analysis:</span>
+            <Select
+              disabled={analysesState.loading || !selectedDictionary || loading}
+              value={selectedAnalysis || undefined}
+              onValueChange={setSelectedAnalysis}
+            >
+              <SelectTrigger className="bg-white">
+                <SelectValue placeholder="Select an analysis" />
+              </SelectTrigger>
+              <SelectContent>
+                {analysesState.value?.map((analysis, i) => (
+                  <SelectItem key={i} value={analysis}>
+                    {analysis}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          {bookmarks.length === 0 ? (
+            <div className="text-center py-8">
+              <p className="text-muted-foreground">No bookmarks found.</p>
+              <p className="text-sm text-muted-foreground mt-2">
+                Start exploring features and bookmark interesting ones!
+              </p>
             </div>
-            {bookmarks.length === 0 ? (
-              <div className="text-center py-8">
-                <p className="text-muted-foreground">No bookmarks found.</p>
-                <p className="text-sm text-muted-foreground mt-2">
-                  Start exploring features and bookmark interesting ones!
-                </p>
-              </div>
-            ) : (
-              <>
-                <Table>
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead>Feature</TableHead>
-                      <TableHead>Dictionary</TableHead>
-                      <TableHead>Series</TableHead>
-                      <TableHead>Created</TableHead>
-                      <TableHead>Tags</TableHead>
-                      <TableHead>Actions</TableHead>
+          ) : (
+            <>
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Feature</TableHead>
+                    <TableHead>Dictionary</TableHead>
+                    <TableHead>Series</TableHead>
+                    <TableHead>Created</TableHead>
+                    <TableHead>Tags</TableHead>
+                    <TableHead>Actions</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {bookmarks.map((bookmark) => (
+                    <TableRow key={`${bookmark.saeName}-${bookmark.featureIndex}`}>
+                      <TableCell>
+                        <Link
+                          to={`/features?dictionary=${bookmark.saeName}&featureIndex=${bookmark.featureIndex}${selectedAnalysis ? `&analysis=${selectedAnalysis}` : ""}`}
+                          className="text-blue-600 hover:underline font-medium"
+                        >
+                          #{bookmark.featureIndex}
+                        </Link>
+                      </TableCell>
+                      <TableCell>{bookmark.saeName}</TableCell>
+                      <TableCell>{bookmark.saeSeries}</TableCell>
+                      <TableCell>
+                        {new Date(bookmark.createdAt).toLocaleDateString()}
+                      </TableCell>
+                      <TableCell>
+                        {bookmark.tags.length > 0 ? (
+                          <div className="flex gap-1">
+                            {bookmark.tags.map((tag, index) => (
+                              <span
+                                key={index}
+                                className="inline-block bg-gray-100 text-gray-800 text-xs px-2 py-1 rounded"
+                              >
+                                {tag}
+                              </span>
+                            ))}
+                          </div>
+                        ) : (
+                          <span className="text-muted-foreground">-</span>
+                        )}
+                      </TableCell>
+                      <TableCell>
+                        <Button
+                          variant="destructive"
+                          size="sm"
+                          onClick={() => removeBookmark(bookmark.saeName, bookmark.featureIndex)}
+                        >
+                          Remove
+                        </Button>
+                      </TableCell>
                     </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {bookmarks.map((bookmark) => (
-                      <TableRow key={`${bookmark.saeName}-${bookmark.featureIndex}`}>
-                        <TableCell>
-                          <Link
-                            to={`/features?dictionary=${bookmark.saeName}&featureIndex=${bookmark.featureIndex}${selectedAnalysis ? `&analysis=${selectedAnalysis}` : ""}`}
-                            className="text-blue-600 hover:underline font-medium"
-                          >
-                            #{bookmark.featureIndex}
-                          </Link>
-                        </TableCell>
-                        <TableCell>{bookmark.saeName}</TableCell>
-                        <TableCell>{bookmark.saeSeries}</TableCell>
-                        <TableCell>
-                          {new Date(bookmark.createdAt).toLocaleDateString()}
-                        </TableCell>
-                        <TableCell>
-                          {bookmark.tags.length > 0 ? (
-                            <div className="flex gap-1">
-                              {bookmark.tags.map((tag, index) => (
-                                <span
-                                  key={index}
-                                  className="inline-block bg-gray-100 text-gray-800 text-xs px-2 py-1 rounded"
-                                >
-                                  {tag}
-                                </span>
-                              ))}
-                            </div>
-                          ) : (
-                            <span className="text-muted-foreground">-</span>
-                          )}
-                        </TableCell>
-                        <TableCell>
-                          <Button
-                            variant="destructive"
-                            size="sm"
-                            onClick={() => removeBookmark(bookmark.saeName, bookmark.featureIndex)}
-                          >
-                            Remove
-                          </Button>
-                        </TableCell>
-                      </TableRow>
-                    ))}
-                  </TableBody>
-                </Table>
+                  ))}
+                </TableBody>
+              </Table>
 
-                {totalPages > 1 && (
-                  <div className="flex justify-center gap-2 mt-4">
-                    <Button
-                      variant="outline"
-                      onClick={() => setPage(page - 1)}
-                      disabled={page === 0}
-                    >
-                      Previous
-                    </Button>
-                    <span className="flex items-center px-4">
-                      Page {page + 1} of {totalPages}
-                    </span>
-                    <Button
-                      variant="outline"
-                      onClick={() => setPage(page + 1)}
-                      disabled={page >= totalPages - 1}
-                    >
-                      Next
-                    </Button>
-                  </div>
-                )}
-              </>
-            )}
-          </CardContent>
-        </Card>
-      </div>
+              {totalPages > 1 && (
+                <div className="flex justify-center gap-2 mt-4">
+                  <Button
+                    variant="outline"
+                    onClick={() => setPage(page - 1)}
+                    disabled={page === 0}
+                  >
+                    Previous
+                  </Button>
+                  <span className="flex items-center px-4">
+                    Page {page + 1} of {totalPages}
+                  </span>
+                  <Button
+                    variant="outline"
+                    onClick={() => setPage(page + 1)}
+                    disabled={page >= totalPages - 1}
+                  >
+                    Next
+                  </Button>
+                </div>
+              )}
+            </>
+          )}
+        </CardContent>
+      </Card>
     </div>
   );
 };
 
-export default BookmarksPage; 
+export default BookmarksPage;

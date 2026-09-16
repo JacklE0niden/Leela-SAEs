@@ -7,6 +7,7 @@ from lm_saes.circuit.leela_board import LeelaBoard
 from pathlib import Path
 from safetensors.torch import load_file
 import sys
+import os
 
 project_root = Path(__file__).parent.parent
 if str(project_root) not in sys.path:
@@ -540,7 +541,10 @@ class IntegratedPolicyLens:
             else:
                 raise ValueError(f"Unknown hook point type: {hook_point}")
             
-            base_dir = f"/inspire/hdd/global_user/hezhengfu-240208120186/rlin_projects/rlin_projects/chess-SAEs-N/activations/{model_prefix}/{subdir}"
+            activation_root = Path(
+                os.environ.get("BT4_ACTIVATION_ROOT", project_root / "activations" / model_prefix)
+            )
+            base_dir = str(activation_root / subdir)
 
         safe_name = hook_point.replace(".", "_")
         file_path = Path(base_dir) / f"{safe_name}_mean.safetensors"

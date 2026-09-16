@@ -327,7 +327,7 @@ class PatchingAnalyzer:
 
         # calculate the logit difference, handle different output formats
         try:
-            # handle original_output, which may be a tensor or a list
+            # handle original_output -可能是 tensor or list
             if isinstance(original_output, torch.Tensor):
                 orig_logits = original_output
                 if orig_logits.ndim == 2 and orig_logits.shape[0] == 1:
@@ -345,7 +345,7 @@ class PatchingAnalyzer:
             else:
                 raise ValueError(f"Unexpected original_output format: {type(original_output)}")
 
-            # handle modified_output, which may be a tensor or a list
+            # handle modified_output -可能是 tensor or list
             if isinstance(modified_output, torch.Tensor):
                 mod_logits = modified_output
                 if mod_logits.ndim == 2 and mod_logits.shape[0] == 1:
@@ -709,9 +709,9 @@ def get_patching_analyzer(metadata: Optional[Dict[str, Any]] = None, combo_id: O
         # build the cache_key (consistent with preload_circuit_models)
         cache_key = f"{BT4_MODEL_NAME}::{combo_id}"
         
-        # try to get the cached model from the shared SAE preload cache (using cache_key)
+        # try to get the cached model from circuits_service (using cache_key)
         try:
-            from sae_combo_service import get_cached_models
+            from circuits_service import get_cached_models
             cached_hooked_model, cached_transcoders, cached_lorsas, _ = get_cached_models(cache_key)
             
             if cached_hooked_model is not None and cached_transcoders is not None and cached_lorsas is not None:
@@ -726,9 +726,9 @@ def get_patching_analyzer(metadata: Optional[Dict[str, Any]] = None, combo_id: O
                 raise ValueError(f"cache not found: cache_key={cache_key}")
         except (ImportError, ValueError) as e:
             print(f"cannot use cache, need to wait for preload to complete: {e}")
-            print(f"tip: please call /sae/preload_combo to preload the model for combo {combo_id}")
+            print(f"tip: please call /circuit/preload_models to preload the model for combo {combo_id}")
             raise RuntimeError(
-                f"model for combo {combo_id} is not preloaded. please call /sae/preload_combo to preload the model, "
+                f"model for combo {combo_id} is not preloaded. please call /circuit/preload_models to preload the model, "
                 f"or wait for preload to complete before using the patching analysis functionality."
             )
         

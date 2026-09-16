@@ -6,6 +6,7 @@ import { Feature } from '@/types/feature';
 import { ChessBoard } from '@/components/chess/chess-board';
 import { FeatureConnections } from '@/components/circuits/feature-connections';
 import { SaeComboLoader } from '@/components/common/SaeComboLoader';
+import { buildBt4AnalysisTemplate, buildBt4DictionaryName } from '@/utils/bt4Sae';
 
 interface CsvRow {
   source_layer: number;
@@ -168,6 +169,11 @@ const mixHexColorsVivid = (hexColors: string[]): string | null => {
 };
 
 export const InteractionCircuitPage = () => {
+  const getCurrentSaeComboId = useCallback(() => {
+    if (typeof window === "undefined") return undefined;
+    return window.localStorage.getItem("bt4_sae_combo_id") || undefined;
+  }, []);
+
   const [csvFiles, setCsvFiles] = useState<File[]>([]);
   const [linkGraphData, setLinkGraphData] = useState<LinkGraphData | null>(null);
   const [isLoading, setIsLoading] = useState(false);
@@ -455,11 +461,11 @@ export const InteractionCircuitPage = () => {
       links,
       metadata: {
         prompt_tokens: [],
-        lorsa_analysis_name: 'BT4_lorsa_L{}A_k30_e16',
-        tc_analysis_name: 'BT4_tc_L{}M_k30_e16',
+        lorsa_analysis_name: buildBt4AnalysisTemplate('lorsa', getCurrentSaeComboId()),
+        tc_analysis_name: buildBt4AnalysisTemplate('tc', getCurrentSaeComboId()),
       },
     };
-  }, []);
+  }, [getCurrentSaeComboId]);
 
   // Merge data from multiple CSV files
   const mergeCsvGraphs = useCallback((graphs: LinkGraphData[], fileNames: string[]): LinkGraphData => {
@@ -577,12 +583,12 @@ export const InteractionCircuitPage = () => {
       links: mergedLinks,
       metadata: {
         prompt_tokens: [],
-        lorsa_analysis_name: 'BT4_lorsa_L{}A_k30_e16',
-        tc_analysis_name: 'BT4_tc_L{}M_k30_e16',
+        lorsa_analysis_name: buildBt4AnalysisTemplate('lorsa', getCurrentSaeComboId()),
+        tc_analysis_name: buildBt4AnalysisTemplate('tc', getCurrentSaeComboId()),
         sourceFileNames: fileNames,
       },
     };
-  }, []);
+  }, [getCurrentSaeComboId]);
 
   // Single file upload
   const handleSingleFileUpload = useCallback(async (file: File) => {
@@ -718,13 +724,12 @@ export const InteractionCircuitPage = () => {
   // Lorsa layer 0 = A0, Transcoder layer 0 = M0
   // So layer value in CSV is directly used to build dictionary name
   const getDictionaryName = useCallback((layer: number, isLorsa: boolean): string => {
-    // Use default BT4 format, layer value used directly (0 is 0, corresponds to A0 or M0)
-    if (isLorsa) {
-      return `BT4_lorsa_L${layer}A_k30_e16`;
-    } else {
-      return `BT4_tc_L${layer}M_k30_e16`;
-    }
-  }, []);
+    return buildBt4DictionaryName(
+      layer,
+      isLorsa ? 'lorsa' : 'tc',
+      getCurrentSaeComboId(),
+    );
+  }, [getCurrentSaeComboId]);
 
   // Helper function: normalize Z-pattern data
   const normalizeZPattern = useCallback(
@@ -747,7 +752,7 @@ export const InteractionCircuitPage = () => {
     []
   );
 
-  // Parse Top Activation data for the interaction graph view
+  // Parse Top Activation data (consistent with circuit-visualization.tsx)
   const parseTopActivationData = useCallback((camelData: any): TopActivationSample[] => {
     const sampleGroups = camelData?.sampleGroups || camelData?.sample_groups || [];
     const allSamples: any[] = [];
@@ -1130,7 +1135,7 @@ export const InteractionCircuitPage = () => {
     // Kept for API compatibility
   }, []);
 
-  // Handle node hover in the interaction graph view
+  // Handle node hover (same semantics as circuit-visualization.tsx)
   // Only update if the hovered ID has actually changed
   // This prevents unnecessary re-renders and keeps hoveredId stable
   const handleNodeHover = useCallback((nodeId: string | null) => {

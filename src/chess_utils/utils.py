@@ -1,18 +1,5 @@
 import chess
 
-PIECE_CODES = ("p", "n", "b", "r", "q", "k")
-CANONICAL_PIECE_TYPES = tuple(
-    f"{owner} {piece_code}"
-    for owner in ("own", "opponent")
-    for piece_code in PIECE_CODES
-)
-
-
-def normalize_piece_type(piece_type: str) -> str:
-    assert piece_type in CANONICAL_PIECE_TYPES
-    return piece_type
-
-
 # 1 fen, square -> pos
 def get_pos_from_square(fen: str, square: str) -> int:
     board = chess.Board(fen)
@@ -23,24 +10,23 @@ def get_pos_from_square(fen: str, square: str) -> int:
         sq = chess.square(file_idx, 7 - rank_idx)
     return sq
 
-
 # 2 fen, piece_type -> bool
 def has_piece_of_type(fen: str, piece_type: str) -> bool:
-    normalized_piece_type = normalize_piece_type(piece_type)
+    assert piece_type in ["own p", "own n", "own b", "own r", "own q", "own k", "opponent p", "opponent n", "opponent b", "opponent r", "opponent q", "opponent k"]
     board = chess.Board(fen)
     side_to_move = board.turn
-    owner_str, piece_str = normalized_piece_type.split()
+    owner_str, piece_str = piece_type.split()
     if owner_str == "own":
         color = side_to_move
     else:
         color = not side_to_move
     piece_map = {
-        "p": chess.PAWN,
-        "n": chess.KNIGHT,
-        "b": chess.BISHOP,
-        "r": chess.ROOK,
-        "q": chess.QUEEN,
-        "k": chess.KING,
+        'p': chess.PAWN,
+        'n': chess.KNIGHT,
+        'b': chess.BISHOP,
+        'r': chess.ROOK,
+        'q': chess.QUEEN,
+        'k': chess.KING,
     }
     piece_type_enum = piece_map[piece_str]
     return len(board.pieces(piece_type_enum, color)) > 0
@@ -48,12 +34,25 @@ def has_piece_of_type(fen: str, piece_type: str) -> bool:
 
 # 3 fen, piece_type -> pos list
 def get_piece_type_pos(fen: str, piece_type: str) -> list[int]:
-    normalized_piece_type = normalize_piece_type(piece_type)
-    if not has_piece_of_type(fen, normalized_piece_type):
+    assert piece_type in [
+        "own p",
+        "own n",
+        "own b",
+        "own r",
+        "own q",
+        "own k",
+        "opponent p",
+        "opponent n",
+        "opponent b",
+        "opponent r",
+        "opponent q",
+        "opponent k",
+    ]
+    if not has_piece_of_type(fen, piece_type):
         return []
     board = chess.Board(fen)
     side_to_move = board.turn
-    owner_str, piece_str = normalized_piece_type.split()
+    owner_str, piece_str = piece_type.split()
     if owner_str == "own":
         color = side_to_move
     else:
@@ -86,7 +85,6 @@ def get_start_end_pos_from_move_uci(fen: str, move_uci: str) -> tuple[int, int]:
     start_pos = get_pos_from_square(fen, start_square)
     end_pos = get_pos_from_square(fen, end_square)
     return start_pos, end_pos
-
 
 # 5 fen, move_uci -> bool
 def is_valid_move_uci(fen: str, move_uci: str) -> bool:

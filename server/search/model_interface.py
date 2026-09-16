@@ -2,16 +2,10 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from functools import lru_cache
-from typing import Optional, Callable, Any
-
-import sys
-import torch
 import chess
-
-# Add leela_interp directory to sys.path for imports (path aligned with local notebook)
-PROJECT_ROOT = "/inspire/hdd/global_user/hezhengfu-240208120186/rlin_projects/rlin_projects/chess-SAEs/exp/leela-interp/src"
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
+import torch
+from lm_saes.circuit.leela_board import LeelaBoard
+from typing import Any, Callable, Optional
 
 DEFAULT_MODEL_NAME = "lc0/BT4-1024x15x32h"
 
@@ -29,8 +23,8 @@ def set_model_getter(getter: Callable[[str], object]) -> None:
     _external_model_getter = getter
 
 
-def _try_get_from_sae_combo_service(model_name: str) -> Optional[object]:
-    """Try to get the cached model from the shared SAE preload service."""
+def _try_get_from_circuits_service(model_name: str) -> Optional[object]:
+    """Try to get the cached model from circuits_service."""
     try:
         import sys
         import os
@@ -38,15 +32,15 @@ def _try_get_from_sae_combo_service(model_name: str) -> Optional[object]:
         if server_dir not in sys.path:
             sys.path.insert(0, server_dir)
         
-        from sae_combo_service import get_cached_models
+        from circuits_service import get_cached_models
         cached_model, _, _, _ = get_cached_models(model_name)
         if cached_model is not None:
-            print(f"✅ [model_interface] Using cached model from sae_combo_service: {model_name}")
+            print(f"✅ [model_interface] Using cached model from circuits_service: {model_name}")
             return cached_model
     except ImportError:
         pass
     except Exception as e:
-        print(f"⚠️ [model_interface] Failed to get model from sae_combo_service: {e}")
+        print(f"⚠️ [model_interface] Failed to get model from circuits_service: {e}")
     return None
 
 
@@ -65,7 +59,7 @@ def _get_model(model_name: str = DEFAULT_MODEL_NAME) -> object:
     """Get model, preferring external cache."""
     if _external_model_getter is not None:
         return _external_model_getter(model_name)
-    cached = _try_get_from_sae_combo_service(model_name)
+    cached = _try_get_from_circuits_service(model_name)
     if cached is not None:
         return cached
     return _get_model_internal(model_name)
@@ -180,9 +174,6 @@ def policy_tensor_to_move_dict(
     Returns:
         Dict mapping UCI move strings to probabilities (normalized over legal moves).
     """
-    import chess
-    from leela_interp import LeelaBoard
-    
     if policy_tensor.dim() > 1:
         policy_logits = policy_tensor[0] if policy_tensor.dim() == 2 else policy_tensor
     else:

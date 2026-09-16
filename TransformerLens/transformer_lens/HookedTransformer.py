@@ -25,7 +25,7 @@ from typing import (
     overload,
 )
 
-import json 
+import json
 import einops
 import numpy as np
 import torch
@@ -56,6 +56,7 @@ from transformer_lens.components import (
     PolicyHead,
     ValueHead,
     MLHHead,
+    ShiftRight,
     LayerNorm,
     LayerNormPre,
     PosEmbed,
@@ -154,14 +155,8 @@ class HookedTransformer(HookedRootModule):
             )
 
         self.cfg = HookedTransformerConfig.unwrap(cfg)
-        tokenizer_name = (self.cfg.tokenizer_name or "").lower()
-        if "chessformer" in tokenizer_name or "searchless-chess" in tokenizer_name:
-            raise NotImplementedError(
-                "ChessFormer and SearchlessChess support has been removed. "
-                "Only Leela chess models remain supported."
-            )
 
-    
+
         self.processor = processor
         if self.processor is not None:
             assert tokenizer is None, "Cannot pass both tokenizer and processor"
@@ -169,7 +164,7 @@ class HookedTransformer(HookedRootModule):
 
         if tokenizer is not None:
             self.set_tokenizer(tokenizer, default_padding_side=default_padding_side)
-            
+
         elif self.cfg.tokenizer_name is not None:
             # If we have a tokenizer name, we can load it from HuggingFace
             if self.cfg.tokenizer_name in NON_HF_HOSTED_MODEL_NAMES:
@@ -192,14 +187,14 @@ class HookedTransformer(HookedRootModule):
                 elif "lc0" in self.cfg.tokenizer_name.lower():
                     tokenizer = LeelaBoard()
                 else:
-                    tokenizer = AutoTokenizer.from_pretrained(  
+                    tokenizer = AutoTokenizer.from_pretrained(
                         self.cfg.tokenizer_name,
                         add_bos_token=True,
                         trust_remote_code=self.cfg.trust_remote_code,
                         use_fast=use_fast,
                         token=huggingface_token,
                     )
-                if tokenizer is not None and not self.cfg.is_leela_chess_model:
+                if tokenizer is not None and self.cfg.is_chess_model is False and self.cfg.is_leela_chess_model is False:
                     self.set_tokenizer(
                         tokenizer,
                         default_padding_side=default_padding_side,
@@ -209,7 +204,7 @@ class HookedTransformer(HookedRootModule):
                 else:
                     self.tokenizer = None
                     self.cfg.vocab_size = -1
-                    
+
         else:
             # If no tokenizer name is provided, we assume we're training on an algorithmic task and
             # will pass in tokens directly. In this case, we don't need a tokenizer.
@@ -220,7 +215,20 @@ class HookedTransformer(HookedRootModule):
                     "default_padding_side is explictly given but ignored because tokenizer is not set."
                 )
 
-        if self.cfg.is_leela_chess_model:
+        if self.cfg.is_chess_model:
+
+            if self.cfg.shift_right:
+                self.shift_right = ShiftRight()
+                self.hook_shift_right = HookPoint()
+            else:
+                self.shift_right = None
+            self.hook_embed = HookPoint()  # [batch, pos, d_model]
+
+            self.act_token = nn.Parameter(torch.randn((1,1,self.cfg.d_model),dtype=self.cfg.dtype) * 0.02)
+
+            self.val_token = nn.Parameter(torch.randn((1,1,self.cfg.d_model),dtype=self.cfg.dtype) * 0.02)
+
+        elif self.cfg.is_leela_chess_model:
             if self.cfg.leela_embed == "normal":
                 print("normal embedding for T82")
                 self.embed = LeelaEmbed(self.cfg.d_model)
@@ -240,11 +248,11 @@ class HookedTransformer(HookedRootModule):
 
         if self.cfg.use_hook_tokens:
             self.hook_tokens = HookPoint()  # [batch, pos]
-            
+
         if self.cfg.is_leela_chess_model:
             self.blocks = nn.ModuleList(
-                [EncoderLayer(self.cfg.d_model, 
-                              self.cfg.n_heads, 
+                [EncoderLayer(self.cfg.d_model,
+                              self.cfg.n_heads,
                               self.cfg.d_mlp,
                               self.cfg.leela_mlp_act_fn,
                               self.cfg.leela_resid_alpha,) for block_index in range(self.cfg.n_layers)]
@@ -255,7 +263,7 @@ class HookedTransformer(HookedRootModule):
             self.blocks = nn.ModuleList(
                 [TransformerBlock(self.cfg, block_index) for block_index in range(self.cfg.n_layers)]
             )
-        
+
         if not self.cfg.is_leela_chess_model:
             if self.cfg.normalization_type == "RMS":
                 self.ln_final = RMSNorm(self.cfg)
@@ -277,11 +285,20 @@ class HookedTransformer(HookedRootModule):
                 pass
             else:
                 logging.warning("Invalid normalization_type passed in %s", self.cfg.normalization_type)
-            self.unembed = Unembed(self.cfg)
+            if self.cfg.is_chess_model:
+                self.unembed = None
+            else:
+                self.unembed = Unembed(self.cfg)
 
             if self.cfg.init_weights:
                 self.init_weights()
-            
+
+            if self.cfg.is_chess_model:
+                self.linear_final = nn.Linear(self.cfg.d_model, self.cfg.num_return_buckets)
+                self.hook_linear_final = HookPoint()
+                self.logit = torch.nn.LogSoftmax(dim=-1)
+                self.hook_logit = HookPoint()
+
         if self.cfg.is_leela_chess_model:
             self.policy_head = PolicyHead(self.cfg.d_model)
             self.value_head = ValueHead(self.cfg.d_model, self.cfg.d_value_head)
@@ -357,9 +374,11 @@ class HookedTransformer(HookedRootModule):
         """
         if isinstance(input, str) or isinstance(input, list):
             # If text, convert to tokens (batch_size=1)
-            # Input is a string, so run it through the tokenizer first
+            # 输入是一个字符串，要先经过tokenizer一下
             # tokens = self.tokenizer(input)
-            if not self.cfg.is_leela_chess_model:
+            if self.cfg.is_chess_model or self.cfg.is_leela_chess_model:
+                pass
+            else:
                 assert (
                     self.tokenizer is not None
                 ), "Must provide a tokenizer if passing a string to the model"
@@ -424,9 +443,11 @@ class HookedTransformer(HookedRootModule):
             pos_offset = cache_ctx_length
         if self.cfg.use_hook_tokens:
             tokens = self.hook_tokens(tokens)
+        if self.cfg.shift_right:
+            tokens = self.hook_shift_right(self.shift_right(tokens))
         embed = self.hook_embed(self.embed(tokens))  # [batch, pos, d_model]
-        
-        if not self.cfg.is_leela_chess_model:
+
+        if not self.cfg.is_chess_model and not self.cfg.is_leela_chess_model:
             if self.cfg.positional_embedding_type == "standard":
                 pos_embed = self.hook_pos_embed(
                     self.pos_embed(tokens, pos_offset, attention_mask)
@@ -455,6 +476,7 @@ class HookedTransformer(HookedRootModule):
                     f"Invalid positional_embedding_type passed in {self.cfg.positional_embedding_type}"
                 )
         else:
+            bs = embed.shape[0]
             residual = embed
             shortformer_pos_embed = None
         return residual, tokens, shortformer_pos_embed, attention_mask
@@ -663,7 +685,7 @@ class HookedTransformer(HookedRootModule):
                         shortformer_pos_embed=shortformer_pos_embed,
                         attention_mask=attention_mask,
                     )  # [batch, pos, d_model]
-                
+
 
             if self.cfg.is_leela_chess_model:
                 if stop_at_layer is not None:
@@ -678,12 +700,18 @@ class HookedTransformer(HookedRootModule):
                     return residual
 
                 if self.cfg.normalization_type is not None:
-                    
+
                     residual = self.ln_final(residual)  # [batch, pos, d_model]
+                    if self.cfg.is_chess_model:
+                        residual = self.hook_linear_final(self.linear_final(residual))
+                        residual = self.hook_logit(self.logit(residual))
                 if return_type is None:
                     return None
                 else:
-                    logits = self.unembed(residual)  # [batch, pos, d_vocab]
+                    if not self.cfg.is_chess_model:
+                        logits = self.unembed(residual)  # [batch, pos, d_vocab]
+                    else:
+                        logits = residual
                     if self.cfg.output_logits_soft_cap > 0.0:
                         logits = self.cfg.output_logits_soft_cap * F.tanh(
                             logits / self.cfg.output_logits_soft_cap
@@ -844,7 +872,7 @@ class HookedTransformer(HookedRootModule):
         with utils.LocallyOverridenDefaults(
             self, prepend_bos=prepend_bos, padding_side=padding_side
         ):
-            if not self.cfg.is_leela_chess_model:
+            if not self.cfg.is_chess_model and not self.cfg.is_leela_chess_model:
                 assert self.tokenizer is not None, "Cannot use to_tokens without a tokenizer"
                 assert (
                     self.cfg.tokenizer_prepends_bos is not None
@@ -852,13 +880,15 @@ class HookedTransformer(HookedRootModule):
 
             else:
                 assert self.embed is not None, "Cannot use to_tokens without a embed"
-                
 
-            if self.cfg.default_prepend_bos and not self.cfg.tokenizer_prepends_bos and not self.cfg.is_leela_chess_model:
+
+            if self.cfg.default_prepend_bos and not self.cfg.tokenizer_prepends_bos and not self.cfg.is_chess_model and not self.cfg.is_leela_chess_model:
                 # We want to prepend bos but the tokenizer doesn't automatically do it, so we add it manually
                 input = utils.get_input_with_manually_prepended_bos(self.tokenizer, input)
 
-            if self.cfg.is_leela_chess_model:
+            if self.cfg.is_chess_model:
+                tokens, _ = self.tokenizer(input)
+            elif self.cfg.is_leela_chess_model:
                 tokens = self.tokenizer(input)
                 # tokens = torch.from_numpy(tokens).float().unsqueeze(0)
             else:
@@ -870,11 +900,11 @@ class HookedTransformer(HookedRootModule):
                     max_length=self.cfg.n_ctx if truncate else None,
                 )["input_ids"]
 
-            if not self.cfg.default_prepend_bos and self.cfg.tokenizer_prepends_bos and not self.cfg.is_leela_chess_model:
+            if not self.cfg.default_prepend_bos and self.cfg.tokenizer_prepends_bos and not self.cfg.is_chess_model and not self.cfg.is_leela_chess_model:
                 # We don't want to prepend bos but the tokenizer does it automatically, so we remove it manually
                 tokens = utils.get_tokens_with_bos_removed(self.tokenizer, tokens)
 
-            if move_to_device:
+            if move_to_device and not self.cfg.is_chess_model:
                 tokens = tokens.to(self.cfg.device)
             return tokens
 
@@ -996,7 +1026,7 @@ class HookedTransformer(HookedRootModule):
                 raise ValueError(f"Invalid input type to to_str_tokens: {type(input)}")
             str_tokens = self.tokenizer.batch_decode(tokens, clean_up_tokenization_spaces=False)
             return str_tokens
-        
+
     @overload
     def to_tokens_with_origins(
         self,
@@ -1045,7 +1075,7 @@ class HookedTransformer(HookedRootModule):
                 else:
                     raise ValueError(f"Invalid image shape: {images.shape}. Expected 3 or 4 dimensions.")
                 input = {**input, "images": images}
-                
+
             if "images" in input and len(input["images"]) > 0:
                 # Prepend the image token to the text if there's no image token in the text
                 if self.processor.image_token not in input["text"]:
@@ -1056,7 +1086,7 @@ class HookedTransformer(HookedRootModule):
             if self.cfg.default_prepend_bos and not self.cfg.tokenizer_prepends_bos:
                 # We want to prepend bos but the tokenizer doesn't automatically do it, so we add it manually
                 input["text"] = utils.get_input_with_manually_prepended_bos(self.tokenizer, input["text"])
-                
+
             processor = self.processor if self.processor is not None else self.tokenizer
 
             processed = processor(
@@ -1072,24 +1102,24 @@ class HookedTransformer(HookedRootModule):
                 tokens = utils.get_tokens_with_bos_removed(self.tokenizer, tokens)
             assert len(tokens.shape) == 2, "Tokens should have shape [batch, pos]"
             assert tokens.shape[0] == 1, "Only batch size 1 is supported"
-                
-            if not tokens_only:                
+
+            if not tokens_only:
                 str_tokens = processor.batch_decode(tokens[0], clean_up_tokenization_spaces=False)
                 assert len(str_tokens) == tokens.shape[1], "Number of string tokens should match number of tokens"
-                
+
                 def _match_str_tokens_to_input(text: str, str_tokens: List[str]) -> List[Optional[Tuple[int, int]]]:
                     """Match the tokens to the input text, returning a list of tuples of the form (start_idx, end_idx) for each token."""
                     # Initialize list to store token positions
                     token_positions = []
-                    
+
                     # Keep track of current position in text
                     curr_pos = 0
-                    
+
                     # For each token, try to find its position in the input text
                     for token in str_tokens:
                         # Search for token in remaining text
                         pos = text.find(token, curr_pos)
-                        
+
                         if pos != -1:
                             # Found a match, store position and update curr_pos
                             token_positions.append((pos, pos + len(token)))
@@ -1102,11 +1132,11 @@ class HookedTransformer(HookedRootModule):
                             if not ((token.startswith("<") and token.endswith(">")) or "�" in token):
                                 raise ValueError(f"Token {token} not found in input text")
                             token_positions.append(None)
-                            
+
                     return token_positions
 
                 token_origins = [{"key": "text", "range": pos} if pos is not None else None for pos in _match_str_tokens_to_input(input["text"], str_tokens)]
-            
+
             if "images" in input:
                 if "chameleon" in self.cfg.model_name:
                     assert "pixel_values" in processed, "Pixel values are required for Chameleon models"
@@ -1120,70 +1150,70 @@ class HookedTransformer(HookedRootModule):
                     assert n_image_tokens == n_image_tokens_in_text, "Number of image tokens should match number of image tokens in text"
                     special_image_mask = tokens == self.vocabulary_mapping.image_token_id
                     tokens: torch.Tensor = tokens.masked_scatter(special_image_mask, bpe_tokens)
-                    
+
                     if not tokens_only:
                         patch_index_in_image = None
                         image_index = 0
                         n_patches_per_side = int(math.sqrt(processor.image_seq_length))
                         processed_width = processed["pixel_values"].shape[3]
                         processed_height = processed["pixel_values"].shape[2]
-                        
+
                         def _get_patch_coords(patch_index: int, image_index: int) -> Tuple[int, int, int, int]:
                             """Convert a patch index to (x1, y1, x2, y2) percentage coordinates in the original image.
-                            
+
                             The processor will resize the image to make shorter side 512, and then center crop to 512x512.
                             This method reverses the processing to get the original coordinates.
-                            
+
                             Args:
                                 patch_index: Index of the patch (0 to n_patches_per_side^2 - 1)
                                 image_index: Index of the image in the batch
-                                
+
                             Returns:
                                 Tuple of (x1, y1, x2, y2) coordinates as proportions (0-1) of the original image
                             """
                             input_image = input["images"][image_index]
                             input_width = input_image.shape[2]
                             input_height = input_image.shape[1]
-                            
+
                             # Calculate patch size in the 512x512 processed space
                             patch_size = 512 // n_patches_per_side
-                            
+
                             # Convert patch index to x,y coordinates in the 512x512 grid
-                            patch_y = (patch_index // n_patches_per_side) 
+                            patch_y = (patch_index // n_patches_per_side)
                             patch_x = (patch_index % n_patches_per_side)
-                            
+
                             # Get coordinates in 512x512 space
                             x1_512 = patch_x * patch_size
                             y1_512 = patch_y * patch_size
                             x2_512 = (patch_x + 1) * patch_size
                             y2_512 = (patch_y + 1) * patch_size
-                            
+
                             # Calculate scaling from original image to 512x512
                             # The shorter side is scaled to 512, and the image is center cropped
                             scale = 512 / min(input_height, input_width)
                             scaled_width = int(input_width * scale)
                             scaled_height = int(input_height * scale)
-                            
+
                             # Calculate padding for center crop
                             x_offset = (scaled_width - 512) // 2
                             y_offset = (scaled_height - 512) // 2
-                            
+
                             # Convert back to scaled coordinates
                             x1_scaled = x1_512 + x_offset
                             y1_scaled = y1_512 + y_offset
-                            x2_scaled = x2_512 + x_offset 
+                            x2_scaled = x2_512 + x_offset
                             y2_scaled = y2_512 + y_offset
-                            
+
                             # Convert to original image coordinates as proportions
                             x1_pct = (x1_scaled / scale) / input_width
                             y1_pct = (y1_scaled / scale) / input_height
                             x2_pct = (x2_scaled / scale) / input_width
                             y2_pct = (y2_scaled / scale) / input_height
-                            
+
                             return (x1_pct, y1_pct, x2_pct, y2_pct)
-                            
-                            
-                        
+
+
+
                         for i, token in enumerate(str_tokens):
                             if token == self.processor.image_start_token:
                                 patch_index_in_image = 0
@@ -1201,7 +1231,7 @@ class HookedTransformer(HookedRootModule):
                                     patch_index_in_image += 1
                 else:
                     raise ValueError("Only Chameleon models are currently supported for image inputs")
-            
+
             if tokens_only:
                 return tokens
             else:
@@ -1378,6 +1408,8 @@ class HookedTransformer(HookedRootModule):
             self.unembed.to(devices.get_device_for_block_index(self.cfg.n_layers - 1, self.cfg))
         for i, block in enumerate(self.blocks):
             block.to(devices.get_device_for_block_index(i, self.cfg))
+        if self.cfg.is_chess_model:
+            self.linear_final.to(devices.get_device_for_block_index(0, self.cfg))
         if self.cfg.is_leela_chess_model:
             self.policy_head.to(devices.get_device_for_block_index(0, self.cfg))
             self.value_head.to(devices.get_device_for_block_index(0, self.cfg))
@@ -1591,7 +1623,7 @@ class HookedTransformer(HookedRootModule):
         # Load the config into an HookedTransformerConfig object. If loading from a
         # checkpoint, the config object will contain the information about the
         # checkpoint
-        
+
         cfg = loading.get_pretrained_model_config(
             official_model_name,
             hf_cfg=hf_cfg,
@@ -1637,7 +1669,7 @@ class HookedTransformer(HookedRootModule):
         state_dict = loading.get_pretrained_state_dict(
             official_model_name, cfg, hf_model, dtype=dtype, **from_pretrained_kwargs
         )
-        
+
         # Create the HookedTransformer object
         model = cls(
             cfg,
@@ -1646,8 +1678,8 @@ class HookedTransformer(HookedRootModule):
             move_to_device=False,
             default_padding_side=default_padding_side,
         )
-    
-        
+
+
         if "chameleon" in model_name.lower():
             assert hf_model is not None, "HF model must be provided for Chameleon models to extract the VQ model"
             model.vqmodel = hf_model.model.vqmodel

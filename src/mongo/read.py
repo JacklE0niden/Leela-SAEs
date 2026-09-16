@@ -5,6 +5,7 @@ from src.lm_saes.resource_loaders import load_dataset_shard
 from typing import Optional, Dict, List, Tuple, Any
 from datasets import load_from_disk
 import os
+from pathlib import Path
 import numpy as np
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -14,7 +15,10 @@ try:
 except ImportError:
     HAS_NUMPY = False
 
-DATASET_PATH = "/inspire/hdd/global_user/hezhengfu-240208120186/data/rlin_data/Chess/chess_master_data"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DATASET_PATH = os.environ.get(
+    "CHESS_DATASET_PATH", str(REPO_ROOT / "data" / "chess_master_data")
+)
 
 def get_fen_from_context_idx(context_idx: int, dataset_path: str = DATASET_PATH,
                            shard_idx: int = 0, n_shards: int = 1, mongo_client=None, dataset_name: str = "master") -> Optional[str]:
@@ -500,7 +504,7 @@ def _process_sae_features_batch(mongo_client, sae_features, result):
                 context_idx_to_fen.update(shard_results)
     except Exception as e:
         print(f"multi-thread load failed, fall back to sequential load: {e}")
-        # Fall back to sequential loading
+        # 回退到顺序加载
         for shard_info in tqdm(shard_groups.items(), desc="sequential load shards"):
             shard_results = load_single_shard(shard_info)
             context_idx_to_fen.update(shard_results)
@@ -573,7 +577,7 @@ def _process_sae_features_batch(mongo_client, sae_features, result):
     try:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [executor.submit(generate_fen_list, feature_info) for feature_info in feature_to_contexts.items()]
-            for i, future in enumerate(tqdm(as_completed(futures), total=len(futures), desc="Generate FEN lists")):
+            for i, future in enumerate(tqdm(as_completed(futures), total=len(futures), desc="生成FEN列表")):
                 key, fen_list = future.result()
                 result[key] = fen_list
 
@@ -600,4 +604,3 @@ def _process_sae_features_batch(mongo_client, sae_features, result):
     print(f"total generated {total_fens} unique FENs")
     avg_fens_per_feature = total_fens / len(result) if result else 0
     print(f"average {avg_fens_per_feature:.1f} FENs per feature")
-

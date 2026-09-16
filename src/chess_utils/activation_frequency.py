@@ -3,7 +3,7 @@ from typing import Iterable, Literal, Tuple
 import torch
 from tqdm.auto import tqdm
 
-from .utils import get_piece_type_pos, get_pos_from_square, normalize_piece_type
+from .utils import get_piece_type_pos, get_pos_from_square
 
 
 FeatureType = Literal["transcoder", "lorsa"]
@@ -22,7 +22,20 @@ def feature_frequency_with_piece_type(
     device: torch.device | str = "cuda",
 ) -> tuple[float, int, int]:
     if piece_type is not None:
-        piece_type = normalize_piece_type(piece_type)
+        assert piece_type in [
+            "own p",
+            "own n",
+            "own b",
+            "own r",
+            "own q",
+            "own k",
+            "opponent p",
+            "opponent n",
+            "opponent b",
+            "opponent r",
+            "opponent q",
+            "opponent k",
+        ]
     assert feature_type in ["transcoder", "lorsa"]
     assert layer in range(model.cfg.n_layers)
 

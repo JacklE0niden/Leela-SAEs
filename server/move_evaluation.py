@@ -1,7 +1,10 @@
+import os
+import shutil
+
 import chess
 import chess.engine
 from typing import Optional, Dict, Any, Tuple
-ENGINE_PATH = "/inspire/hdd/global_user/hezhengfu-240208120186/rlin_projects/rlin_projects/Stockfish/src/stockfish"
+ENGINE_PATH = os.environ.get("STOCKFISH_PATH") or shutil.which("stockfish") or "stockfish"
 ENGINE_TIME_LIMIT = 0.2
 
 

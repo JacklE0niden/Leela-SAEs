@@ -1,7 +1,10 @@
+import os
+import shutil
+
 import chess
 import chess.engine
 
-ENGINE_PATH = "/inspire/hdd/global_user/hezhengfu-240208120186/rlin_projects/rlin_projects/Stockfish/src/stockfish"
+ENGINE_PATH = os.environ.get("STOCKFISH_PATH") or shutil.which("stockfish") or "stockfish"
 
 def safe_board(fen: str):
     try:

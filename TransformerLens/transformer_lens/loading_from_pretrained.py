@@ -44,6 +44,8 @@ from transformer_lens.pretrained.weight_conversions import (
     convert_qwen2_weights,
     convert_qwen_weights,
     convert_t5_weights,
+
+    # newly added searchless chess model
     convert_leela_weights,
 )
 
@@ -239,6 +241,9 @@ OFFICIAL_MODEL_NAMES = [
     "google-t5/t5-large",
     "ai-forever/mGPT",
     "facebook/chameleon-7b",
+    "kaupane/ChessFormer-SL",
+    "google/searchless-chess-270M",
+    "google/searchless-chess-9M-behavioral-cloning",
     "lc0/T82-768x15x24h",
     "lc0/BT4-1024x15x32h",
 ]
@@ -667,6 +672,9 @@ MODEL_ALIASES = {
     "google-t5/t5-large": ["t5-large"],
     "ai-forever/mGPT": ["mGPT"],
     "facebook/chameleon-7b": ["chameleon-7b"],
+    "kaupane/ChessFormer-SL": ["chessformer-sl"],
+    "google/searchless-chess-270M": ["searchless-chess-270M"],
+    "google/searchless-chess-9M-behavioral-cloning": ["searchless-chess-9M-behavioral-cloning"],
     "lc0/T82-768x15x24h": ["T82-768x15x24h"],
     "lc0/BT4-1024x15x32h": ["BT4-1024x15x32h"],
 }
@@ -1524,6 +1532,48 @@ def convert_neel_model_config(official_model_name: str, **kwargs):
         cfg_dict["positional_embedding_type"] = "standard"
     return cfg_dict
 
+def convert_searchless_chess_model_config(official_model_name: str, **kwargs):
+
+    official_model_name = get_official_model_name(official_model_name)
+    if "behavioral-cloning" in official_model_name:
+        cfg_dict = {
+            "d_model": 256,
+            "d_head": 256 // 8,
+            "n_heads": 8,
+            "d_mlp": 256 * 4,
+            "n_layers": 8,
+            "n_ctx": 78,
+            "eps": 1e-05,
+            "act_fn": "silu",
+            "normalization_type": "LN",
+            "is_chess_model": True,
+            "gated_mlp": True,
+            "attention_dir": "bidirectional",
+            "tokenizer_name": "searchless-chess-behavioral-cloning",
+            "num_return_buckets": 1968,
+            "d_vocab": 31,
+            "shift_right": True,
+        }
+    else:
+        cfg_dict = {
+            "d_model": 1024,
+            "d_head": 1024 // 8,
+            "n_heads": 8,
+            "d_mlp": 1024 * 4,
+            "n_layers": 16,
+            "n_ctx": 79,
+            "eps": 1e-05,
+            "act_fn": "silu",
+            "normalization_type": "LN",
+            "is_chess_model": True,
+            "gated_mlp": False,
+            "attention_dir": "bidirectional",
+            "tokenizer_name": "searchless-chess",
+            "d_vocab": 1968,
+            "shift_right": True,
+        }
+    return cfg_dict
+
 def convert_lc0_model_config(model_name: str):
     if model_name == "lc0/T82-768x15x24h":
         return {
@@ -1632,6 +1682,8 @@ def get_pretrained_model_config(
         or official_model_name.startswith("Baidicoot")
     ):
         cfg_dict = convert_neel_model_config(official_model_name, **kwargs)
+    elif "searchless-chess" in official_model_name:
+        cfg_dict = convert_searchless_chess_model_config(official_model_name, **kwargs)
     elif "lc0" in official_model_name:
         cfg_dict = convert_lc0_model_config(official_model_name)
     else:
@@ -1658,7 +1710,7 @@ def get_pretrained_model_config(
             "You tried to specify fold_ln=True for a shortformer model, but this can't be done! Setting fold_ln=False instead."
         )
         fold_ln = False
-    
+
     if device is not None:
         cfg_dict["device"] = device
 
@@ -1690,8 +1742,8 @@ def get_pretrained_model_config(
             cfg_dict["checkpoint_index"] = checkpoint_labels.index(checkpoint_value)
     else:
         cfg_dict["from_checkpoint"] = False
-        
-        
+
+
     cfg_dict["device"] = device
     cfg_dict["n_devices"] = n_devices
     cfg_dict["default_prepend_bos"] = default_prepend_bos
@@ -1822,18 +1874,52 @@ def get_pretrained_state_dict(
             state_dict = convert_neel_solu_old_weights(state_dict, cfg)
         elif cfg.original_architecture == "mingpt":
             state_dict = convert_mingpt_weights(state_dict, cfg)
-        return state_dict    
+        return state_dict
+    elif "searchless-chess" in official_model_name:
+        hf_model = None
+        repo_root = Path(__file__).resolve().parents[2]
+        searchless_root = Path(
+            os.environ.get("SEARCHLESS_CHESS_MODEL_ROOT", repo_root / "models" / "searchless_chess")
+        )
+        if "behavioral-cloning" in official_model_name:
+            print(f"official_model_name11: {official_model_name}")
+            default_pytorch_checkpoint = os.environ.get(
+                "SEARCHLESS_CHESS_BEHAVIORAL_CHECKPOINT",
+                str(searchless_root / "checkpoints" / "9M_behavioral_cloning_torch" / "behavioral_cloning_params.pt"),
+            )
+        else:
+            default_pytorch_checkpoint = os.environ.get(
+                "SEARCHLESS_CHESS_CHECKPOINT",
+                str(searchless_root / "checkpoints" / "270M_torch" / "searchless_chess.pt"),
+            )
+        load_dict = torch.load(default_pytorch_checkpoint, map_location='cpu')
+        print(f"load_dict keys: {load_dict.keys()}")
+        if "behavioral-cloning" in official_model_name:
+            state_dict = load_dict['state_dict']
+            model_config = load_dict['model_config']
+            print(f"model_config: {model_config}")
+        else:
+            state_dict = load_dict['state_dict']
+            model_config = load_dict['model_config']
+            print(f"model_config: {model_config}")
+
     elif "lc0" in official_model_name:
         hf_model = None
-        Project_root = "/path/to/models"
+        repo_root = Path(__file__).resolve().parents[2]
+        lc0_model_root = Path(
+            os.environ.get("LC0_MODEL_ROOT", repo_root / "models" / "lc0")
+        )
         if "T82" in official_model_name:
-            default_pytorch_checkpoint = "/path/to/models/lc0/T82.pt"
+            default_pytorch_checkpoint = os.environ.get(
+                "LC0_T82_CHECKPOINT", str(lc0_model_root / "T82.pt")
+            )
         elif "BT4" in official_model_name:
-            default_pytorch_checkpoint = "/path/to/models/lc0/BT4.pt"
+            default_pytorch_checkpoint = os.environ.get(
+                "LC0_BT4_CHECKPOINT", str(lc0_model_root / "BT4.pt")
+            )
         else:
             raise ValueError(f"Checkpoints for model {official_model_name} are not supported")
         load_dict = torch.load(default_pytorch_checkpoint, map_location='cpu')
-        # print(f"load_dict keys: {load_dict.keys()}")
         state_dict = convert_leela_weights(load_dict, cfg)
         print(f"state_dict keys: {state_dict.keys()}")
         return state_dict
@@ -1959,7 +2045,7 @@ def fill_missing_keys(model, state_dict):
     default_state_dict = model.state_dict()
     # Get the keys that are missing from the pretrained model
     missing_keys = set(default_state_dict.keys()) - set(state_dict.keys())
-    print("[fill_missing_keys] missing_keys:", missing_keys)  # Added debug print
+    print("[fill_missing_keys] missing_keys:", missing_keys)  # 新增调试打印
     # Fill in the missing keys with the default initialization
     for key in missing_keys:
         if "hf_model" in key:

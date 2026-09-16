@@ -1,4 +1,6 @@
 
+from pathlib import Path
+
 import torch
 from lm_saes import (
     ActivationFactoryTarget,
@@ -11,6 +13,7 @@ from lm_saes import (
 
 
 if __name__ == "__main__":
+    repo_root = Path(__file__).resolve().parents[1]
     settings = GenerateActivationsSettings(
         model=LanguageModelConfig(
             model_name="lc0/BT4-1024x15x32h",
@@ -19,13 +22,13 @@ if __name__ == "__main__":
         ),
         model_name="lc0/BT4-1024x15x32h",
         dataset=DatasetConfig(
-            dataset_name_or_path="/path/to/dataset",
+            dataset_name_or_path=str(repo_root / "data" / "chess_master_data"),
             is_dataset_on_disk=True,
         ),
         dataset_name="master",
         hook_points=[f"blocks.{layer}.hook_mlp_out" for layer in range(15)] + [f"blocks.{layer}.resid_mid_after_ln" for layer in range(15)],
         
-        output_dir="/path/to/activations",
+        output_dir=str(repo_root / "activations"),
         total_tokens=801_000_000,
         context_size=64,
         n_samples_per_chunk=None,
@@ -42,4 +45,3 @@ if __name__ == "__main__":
     generate_activations(settings)
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
-

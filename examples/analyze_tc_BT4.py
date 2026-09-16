@@ -1,6 +1,7 @@
-import torch
-import os
 import argparse
+from pathlib import Path
+
+import torch
 
 from lm_saes import (
     ActivationFactoryActivationsSource,
@@ -14,6 +15,7 @@ from lm_saes import (
 )
 from lm_saes.utils.timer import timer
 
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Analyze TC features.")
     parser.add_argument('--layer', type=int, default=14, help='Layer to analyze. (default: 14)')
@@ -25,6 +27,7 @@ def parse_args():
 
 
 if __name__ == "__main__":
+    repo_root = Path(__file__).resolve().parents[1]
     
     timer.enable()
     args = parse_args()
@@ -34,7 +37,7 @@ if __name__ == "__main__":
     
     settings = AnalyzeSAESettings(
         sae=SAEConfig.from_pretrained(
-            f"/path/to/tc/L{layer}",
+            str(repo_root / "result_BT4" / "tc" / folder_name / f"L{layer}"),
             device="cuda", 
             dtype=torch.float32,
         ),
@@ -56,7 +59,7 @@ if __name__ == "__main__":
         activation_factory=ActivationFactoryConfig(
             sources=[
                 ActivationFactoryActivationsSource(
-                    path="/path/to/activations",
+                    path=str(repo_root / "activations"),
                     type="activations",
                     name="master",
                     device="cuda",

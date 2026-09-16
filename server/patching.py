@@ -218,9 +218,9 @@ def get_patching_analyzer() -> PatchingAnalyzer:
             
             model_name = 'lc0/BT4-1024x15x32h'
             
-            # try to get the cached model from the shared SAE preload cache
+            # try to get the cached model from circuits_service
             try:
-                from sae_combo_service import get_cached_models
+                from circuits_service import get_cached_models
                 cached_hooked_model, cached_transcoders, cached_lorsas, _ = get_cached_models(model_name)
                 
                 if cached_hooked_model is not None and cached_transcoders is not None and cached_lorsas is not None:
@@ -235,6 +235,12 @@ def get_patching_analyzer() -> PatchingAnalyzer:
                     raise ValueError("cache not found")
             except (ImportError, ValueError) as e:
                 print(f"cannot use cache, need to reload: {e}")
+                try:
+                    from .constants import get_bt4_sae_combo
+                except ImportError:
+                    from constants import get_bt4_sae_combo
+
+                combo = get_bt4_sae_combo(None)
                 
                 # load model - force using BT4
                 model = HookedTransformer.from_pretrained_no_processing(
@@ -246,9 +252,7 @@ def get_patching_analyzer() -> PatchingAnalyzer:
                 transcoders = {}
                 for layer in range(15):
                     transcoders[layer] = SparseAutoEncoder.from_pretrained(
-                        (f'/inspire/hdd/global_user/hezhengfu-240208120186/'
-                         f'rlin_projects/rlin_projects/chess-SAEs-N/result_BT4/tc/'
-                         f'L{layer}'),
+                        str(Path(combo["tc_base_path"]) / f"L{layer}"),
                         dtype=torch.float32,
                         device='cuda',
                     )
@@ -257,9 +261,7 @@ def get_patching_analyzer() -> PatchingAnalyzer:
                 lorsas = []
                 for layer in range(15):
                     lorsas.append(LowRankSparseAttention.from_pretrained(
-                        (f'/inspire/hdd/global_user/hezhengfu-240208120186/'
-                         f'rlin_projects/rlin_projects/chess-SAEs-N/result_BT4/lorsa/'
-                         f'L{layer}'), 
+                        str(Path(combo["lorsa_base_path"]) / f"L{layer}"),
                         device='cuda'
                     ))
             

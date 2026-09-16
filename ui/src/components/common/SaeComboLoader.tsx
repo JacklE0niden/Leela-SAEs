@@ -34,43 +34,64 @@ export const SaeComboLoader: React.FC<SaeComboLoaderProps> = ({ title, className
 
   const backendBase = import.meta.env.VITE_BACKEND_URL ?? "";
 
-  // Fetch available combo information
-  useEffect(() => {
-    const fetchCombos = async () => {
-      try {
-        const res = await fetch(`${backendBase}/sae/combos`);
-        if (!res.ok) {
-          throw new Error(`HTTP ${res.status}`);
-        }
-        const data = await res.json();
-        const backendCombos: SaeCombo[] = data.combos ?? [];
-        setCombos(backendCombos);
-        setDefaultId(data.default_id ?? null);
-        setCurrentServerId(data.current_id ?? null);
-
-        const stored = window.localStorage.getItem(LOCAL_STORAGE_KEY);
-        const initialId =
-          (stored && backendCombos.some((c) => c.id === stored) && stored) ||
-          data.current_id ||
-          data.default_id ||
-          (backendCombos.length > 0 ? backendCombos[0].id : null);
-
-        setSelectedId(initialId);
-
-        // On initial load, assume backend current_id is already loaded
-        if (data.current_id) {
-          setLoadedId(data.current_id);
-        } else {
-          setLoadedId(null);
-        }
-      } catch (err) {
-        console.error("Failed to fetch SAE combos:", err);
+  const fetchCombos = useCallback(async (preserveSelection: boolean = true) => {
+    try {
+      const res = await fetch(`${backendBase}/sae/combos`);
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
       }
-    };
-    fetchCombos();
+      const data = await res.json();
+      const backendCombos: SaeCombo[] = data.combos ?? [];
+      setCombos(backendCombos);
+      setDefaultId(data.default_id ?? null);
+      setCurrentServerId(data.current_id ?? null);
+
+      const stored = window.localStorage.getItem(LOCAL_STORAGE_KEY);
+      const initialId =
+        (stored && backendCombos.some((c) => c.id === stored) && stored) ||
+        data.current_id ||
+        data.default_id ||
+        (backendCombos.length > 0 ? backendCombos[0].id : null);
+
+      setSelectedId((prev) => (preserveSelection && prev ? prev : initialId));
+      setLoadedId(data.current_id ?? stored ?? null);
+    } catch (err) {
+      console.error("Failed to fetch SAE combos:", err);
+    }
   }, [backendBase]);
 
-  // Do not poll /sae/preload_logs to avoid continuous log spam
+  // Fetch available combo information
+  useEffect(() => {
+    fetchCombos(false);
+  }, [fetchCombos]);
+
+  // Keep local UI in sync with combo changes within the same tab and across tabs.
+  useEffect(() => {
+    const syncFromStorage = () => {
+      const stored = window.localStorage.getItem(LOCAL_STORAGE_KEY);
+      if (stored) {
+        setLoadedId(stored);
+        setCurrentServerId((prev) => prev ?? stored);
+      }
+    };
+
+    window.addEventListener("storage", syncFromStorage);
+    const interval = window.setInterval(syncFromStorage, 1000);
+
+    return () => {
+      window.removeEventListener("storage", syncFromStorage);
+      window.clearInterval(interval);
+    };
+  }, []);
+
+  // Heal stale loading state if the selected combo is already known as loaded.
+  useEffect(() => {
+    if (isLoading && selectedId && (selectedId === loadedId || selectedId === currentServerId)) {
+      setIsLoading(false);
+    }
+  }, [isLoading, selectedId, loadedId, currentServerId]);
+
+  // 不再轮询 /circuit/loading_logs，避免持续打日志
 
   const handleCancel = useCallback(async () => {
     try {
@@ -78,7 +99,7 @@ export const SaeComboLoader: React.FC<SaeComboLoaderProps> = ({ title, className
         model_name: "lc0/BT4-1024x15x32h",
         sae_combo_id: loadedId || selectedId,
       };
-      await fetch(`${backendBase}/sae/cancel_preload`, {
+      await fetch(`${backendBase}/circuit/cancel_loading`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -96,7 +117,7 @@ export const SaeComboLoader: React.FC<SaeComboLoaderProps> = ({ title, className
     // If another combo is currently loading, cancel it first
     if (loadedId && loadedId !== selectedId && isLoading) {
       try {
-        await fetch(`${backendBase}/sae/cancel_preload`, {
+        await fetch(`${backendBase}/circuit/cancel_loading`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -120,7 +141,7 @@ export const SaeComboLoader: React.FC<SaeComboLoaderProps> = ({ title, className
         model_name: "lc0/BT4-1024x15x32h",
         sae_combo_id: selectedId,
       };
-      const res = await fetch(`${backendBase}/sae/preload_combo`, {
+      const res = await fetch(`${backendBase}/circuit/preload_models`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -135,16 +156,19 @@ export const SaeComboLoader: React.FC<SaeComboLoaderProps> = ({ title, className
       setCurrentServerId(data.sae_combo_id);
       setLoadedId(data.sae_combo_id);
       window.localStorage.setItem(LOCAL_STORAGE_KEY, data.sae_combo_id);
-      window.alert(`SAE combo ${data.sae_combo_id} loaded successfully`);
+      await fetchCombos();
+      window.alert(`SAE combo ${data.sae_combo_id} 已加载完成`);
     } catch (err) {
       console.error("Failed to preload SAE models:", err);
       setIsLoading(false);
       if (loadedId === selectedId) {
         setLoadedId(null);
       }
-      window.alert("Failed to load SAE combo. Please try again later.");
+      window.alert("加载 SAE combo 失败，请稍后重试");
+    } finally {
+      setIsLoading(false);
     }
-  }, [selectedId, loadedId, backendBase]);
+  }, [selectedId, loadedId, isLoading, backendBase, fetchCombos]);
 
   const canReload = selectedId != null && !isLoading;
 
@@ -173,7 +197,7 @@ export const SaeComboLoader: React.FC<SaeComboLoaderProps> = ({ title, className
             value={selectedId ?? undefined}
             onValueChange={(value) => {
               setSelectedId(value);
-              // When switching combos, update frontend state only and do not request loading logs
+              // 切换 combo 时只更新前端状态，不再请求 loading_logs
               if (value === currentServerId) {
                 setLoadedId(value);
               } else {
@@ -222,5 +246,3 @@ export const SaeComboLoader: React.FC<SaeComboLoaderProps> = ({ title, className
     </div>
   );
 };
-
-
