@@ -1,10 +1,16 @@
-# Tracing the Thought of a Grandmaster-level Chess-Playing Transformer
+# Tracing the Internal Computation of a Chess Transformer
 
-This repository contains the code for experiments and analyses in **Tracing the Thought of a Grandmaster-level Chess-Playing Transformer**. Its primary workflow is **circuit tracing**: decompose an LC0/BT4 move into a sparse attribution graph over Transcoder and Lorsa features, inspect the graph, and optionally organize it into semantic supernodes.
+This repository accompanies **Tracing the Internal Computation of a Chess Transformer**. It provides an end-to-end circuit-tracing framework for LC0 BT4: Transcoders and Low-Rank Sparse Attention (Lorsa) decompose MLP and attention computations into sparse features, and attribution graphs trace information flow from the chessboard through those features to move logits.
+
+## What this repository provides
+
+The circuit-tracing pipeline replaces LC0 BT4's MLP and attention computations with Transcoders and Lorsa features, then constructs complete attribution graphs connecting board inputs to move logits. Lorsa is adapted to LC0's Smolgen-biased bidirectional attention, while the bilinear policy head is traced through its query and key sides before the resulting graphs are merged.
+
+The repository also includes tools for inspecting feature activations and Lorsa z-patterns, assigning chess-structured interpretations, and organizing graph features into semantic supernodes. The resulting graphs support both position-level case studies and aggregate analysis. In the paper, they reveal internally parallel, move-specific computations and progressive concentration of attribution on the selected move's source and target squares across layers.
 
 ## Circuit tracing quickstart
 
-Circuit tracing has two supported entry points. Both use the same attribution implementation and produce graph JSON that can be reopened on the **Circuits** page.
+Circuit tracing has two supported entry points. Both use the same tracing implementation and produce graph JSON that can be reopened on the **Circuits** page.
 
 ### WebUI (recommended)
 
@@ -39,22 +45,20 @@ The command writes a timestamped JSON file under `circuit_trace_results/`. Use `
 
 Before tracing, provide the BT4 base checkpoint and one Transcoder/Lorsa combo as described in [Checkpoint layout](#1-prepare-the-checkpoints). Circuit tracing normally requires a CUDA GPU.
 
-
-## Example: Reasoning Pathway of a Grandmaster-Level Movement by BT4
+## Example: Attribution graph for multiple strategic cues
 
 <p align="center">
-  <img src="figures/example.svg" alt="Superhuman performance" width="700" />
+  <img src="figures/example.svg" alt="Attribution graph for BT4's Ne5 decision" width="700" />
 </p>
 
-**Interpretation of the reasoning pathway shown in the figure:**
+This case study groups features from the complete attribution graph into semantic clusters. The graph indicates that BT4's `Ne5` decision integrates several strategic and tactical signals:
 
-- e5 is identified as protected by the pawn on d4
-- Ne5 interacts with the Qf7+ threat to create mating pressure
-- Ne5 supports subsequent Bg2 development
-- After Ne5, the ...Bb7 diagonal no longer attacks the knight
-- The pathway reflects anticipation of the response Qe7
-- We find features encoding files where an own rook/queen is blocked by a pawn, but becomes exposed to threaten the opponent king/queen after a diagonal pawn capture. They serve to open up a file for the rook/queen.
-
+- `e5` is identified as protected by the pawn on `d4`.
+- `Ne5` interacts with the `Qf7+` threat to create mating pressure.
+- `Ne5` supports the subsequent development of `Bg2`.
+- After `Ne5`, the `...Bb7` diagonal no longer attacks the knight.
+- Features capture relevant opponent-response considerations, including the plausible reply `Qe7`.
+- Other features encode files where an own rook or queen is initially blocked by a pawn but becomes exposed after a diagonal pawn capture, supporting the opening of an attacking file.
 
 ## Installation
 
@@ -72,9 +76,9 @@ bun install
 cd ..
 ```
 
-## Pretrained Transcoder & Lorsa weights (recommended)
+## Pretrained Transcoder and Lorsa weights
 
-Layer-wise checkpoints trained on `lc0/BT4-1024x15x32h` are hosted on Hugging Face. **Use these when you only need to analyze or build reasoning pathways** without retraining.
+Layer-wise checkpoints trained on `lc0/BT4-1024x15x32h` are hosted on Hugging Face. Use these checkpoints to run circuit tracing, inspect sparse features, reproduce attribution-graph analyses, or export reasoning-path summaries without retraining.
 
 | Component | Hugging Face repo |
 |-----------|-------------------|
@@ -102,68 +106,7 @@ snapshot_download(
 
 Use these as the Transcoder / Lorsa roots (layers `L0`–`L14` live under each combo), e.g. `result_BT4/tc/k_30_e_16` and `result_BT4/lorsa/k_30_e_16`. Pass `--tc-root` / `--lorsa-root` to `examples/generate_reasoning_pathway.py` if they differ from the script defaults. The WebUI backend reads the same layout from `result_BT4/` by default; set `BT4_SAE_ROOT` to override it.
 
-You still need the **BT4 base model** in TransformerLens format (`BT4.pt` under `models/lc0/`) to run the model. Set `LC0_BT4_CHECKPOINT` if it lives elsewhere. If you do not have it yet, build it from ONNX as described under **B) Training your own sparse replacement models → BT4 base checkpoint from ONNX** (or obtain a compatible `BT4.pt` by other means).
-
----
-
-## Reasoning-pathway and training workflows (optional)
-
-### A) Using pretrained HF checkpoints (primary)
-
-1. Install dependencies (`uv sync`, etc.).
-2. Ensure the BT4 base checkpoint is available (`models/lc0/BT4.pt`; see **B) → BT4 base checkpoint from ONNX** if you need to build it).
-3. Download Transcoder + Lorsa for one combo from [lc0-BT4-tc](https://huggingface.co/JacklE0niden/lc0-BT4-tc) and [lc0-BT4-lorsa](https://huggingface.co/JacklE0niden/lc0-BT4-lorsa).
-4. Generate reasoning pathways, for example:
-
-```bash
-python examples/generate_reasoning_pathway.py
-```
-
-Adjust `--tc-root` / `--lorsa-root` if your directories differ from the script defaults.
-
-### B) Training your own sparse replacement models
-
-Use this path when you need **custom** Transcoders / Lorsa (hyperparameters, data, or ablations). Pretrained HF weights are still listed above for the common case.
-
-Relevant scripts live under `examples/` and `src/reasoning_path/path_generation/`. You will likely need to edit model name, layer index, output paths, and other settings.
-
-#### BT4 base checkpoint from ONNX
-
-`weight_conversion.py` builds the PyTorch **base model** checkpoint (`BT4.pt`) used by `HookedTransformer` / LC0 loading. This is **not** how you download pretrained sparse replacements (those are the Hugging Face repos above)—it only produces the dense BT4 backbone.
-
-1. Obtain the BT4 network from LCZero (e.g. `BT4-1024x15x32h-swa-6147500.pb.gz` from [big-transformers](https://storage.lczero.org/files/networks-contrib/big-transformers/)) and export or obtain the matching **ONNX** expected by `examples/weight_conversion.py`.
-
-2. Place the ONNX file at `models/lc0/BT4-1024x15x32h-swa-6147500.onnx`, or pass a different location with `--onnx-path`.
-
-3. Run:
-
-```bash
-python examples/weight_conversion.py
-```
-
-This writes `models/lc0/BT4.pt`. If your layout differs, set `LC0_BT4_CHECKPOINT`; no source edit is required.
-
-After `BT4.pt` is in place, continue with sparse replacement training:
-
-#### 1) Generate activations
-
-```bash
-python examples/gen_tc_BT4.py
-```
-
-#### 2) Train Transcoder / Lorsa
-
-```bash
-python examples/train_tc_BT4.py
-```
-
-(Other Lorsa / evaluation scripts are also under `examples/`.)
-
-#### 3) Generate reasoning pathways
-
-```bash
-python examples/generate_reasoning_pathway.py
-```
+You still need the **BT4 base model** in TransformerLens format (`BT4.pt` under `models/lc0/`) to run the model. Set `LC0_BT4_CHECKPOINT` if it lives elsewhere. If you do not have it yet, build it from ONNX as described under [Training custom sparse replacement models](#training-custom-sparse-replacement-models), or obtain a compatible `BT4.pt` by other means.
 
 ## Circuit tracing tutorial
 
@@ -196,7 +139,7 @@ All runtime defaults are repository-relative. Put backend settings in `server/.e
 |---|---|---|
 | **`LC0_BT4_CHECKPOINT`** | `models/lc0/BT4.pt` | the BT4 base checkpoint is stored elsewhere |
 | **`BT4_SAE_ROOT`** | `result_BT4` | Transcoder/Lorsa combo folders are stored elsewhere |
-| `CHESS_DATASET_PATH` | `data/chess_master_data` | using dataset-backed feature, tactic, or faithfulness tools |
+| `CHESS_DATASET_PATH` | `data/chess_master_data` | using dataset-backed feature or tactic tools |
 | `STOCKFISH_PATH` | `stockfish` from `PATH` | Stockfish is not installed on the executable search path |
 | `BT4_ACTIVATION_ROOT` | `activations/BT4` | logit-lens mean-ablation activations are stored elsewhere |
 | `LC0_T82_CHECKPOINT` | `models/lc0/T82.pt` | using the optional T82 model from another location |
@@ -248,7 +191,6 @@ The trace request is synchronous, while the UI polls `/circuit_trace/logs` to sh
 
 - **Circuits** uploads saved circuit JSON and provides detailed graph inspection, feature cards, activation overlays, and graph comparison.
 - **Semantic Supernode Graph** opens a bundled example or a semantic-supernode JSON proposal and renders the sparse circuit as higher-level Det/Src/Tgt/Mov/Tac reasoning units.
-- **Interaction Circuit** uploads interaction CSV files and analyzes how steering source features changes target-feature activations.
 
 ### Circuit tracing API
 
@@ -273,26 +215,40 @@ curl -X POST http://localhost:3000/circuit_trace \
   }'
 ```
 
-### What “Interaction Circuit” means
-
-**Interaction Circuit is not the search/MCTS circuit tracer.** It consumes feature-interaction CSVs and uses `/interaction/analyze_node_interaction` to intervene on selected source nodes and measure target-node activation changes. The search-based implementation in this repository is `/play_game_with_search` plus `/search_trace/files/{filename}`; its former **Search Circuits** page is intentionally not exposed in the streamlined navigation because the primary product path is sparse attribution circuit tracing.
-
 ## Other experiments
 
 Explore `examples/` for training and analysis patterns. **MongoDB** is recommended for recording configurations and storing analyses. For advanced use, see `src/lm_saes/runners/`.
 
-The paper-only intervention batch utility does not contain a built-in experiment directory list. Supply each input directory explicitly, repeating `--folder` as needed:
+### Reasoning-path export
+
+After installing the model and sparse checkpoints described above, export a compact reasoning-path summary with:
 
 ```bash
-python src/reasoning_path/path_generation/generate_feature_interventions_from_json.py \
-  --folder outputs/experiment-a \
-  --folder outputs/experiment-b \
-  --top-n 400
+python examples/generate_reasoning_pathway.py
 ```
 
-### Visualizing learned dictionaries and reasoning pathways
+Use `--tc-root` and `--lorsa-root` when the checkpoints are stored outside the default `result_BT4/` layout. The supporting modules live under `src/reasoning_path/`.
 
-Analysis results are stored in **MongoDB**. You can browse learned dictionaries and related analyses in the WebUI. The streamlined navigation contains only **Features**, **Dictionaries**, **Bookmarks**, **Circuits**, **Circuit Tracing**, **Semantic Supernode Graph**, and **Interaction Circuit**. Start the FastAPI backend with:
+### Training custom sparse replacement models
+
+Use this path when you need custom Transcoder or Lorsa hyperparameters, training data, or ablations. First obtain the BT4 network from LCZero and convert the matching ONNX checkpoint:
+
+```bash
+python examples/weight_conversion.py
+```
+
+This writes `models/lc0/BT4.pt` by default. It creates the dense BT4 backbone; pretrained sparse replacement checkpoints are downloaded separately from the Hugging Face repositories above. Then generate activations and train the sparse replacements:
+
+```bash
+python examples/gen_tc_BT4.py
+python examples/train_tc_BT4.py
+```
+
+Additional training and evaluation scripts live under `examples/`.
+
+### Other WebUI tools
+
+Analysis results are stored in **MongoDB**. You can browse learned dictionaries and related analyses in the WebUI. The main public workflow uses **Features**, **Dictionaries**, **Bookmarks**, **Circuits**, **Circuit Tracing**, and **Semantic Supernode Graph**. Start the FastAPI backend with:
 
 ```bash
 uv run uvicorn server.app:app --host 0.0.0.0 --port 3000 --env-file server/.env
@@ -304,4 +260,4 @@ cd ui
 bun run dev --port 5173
 ```
 
-That's it! You can now go to http://localhost:5173 to visualize the learned dictionary and its features.
+Open <http://localhost:5173/play-game#circuit-tracing> for the primary circuit-tracing workflow. The other navigation items expose learned dictionaries, individual features, saved circuits, and semantic supernode graphs.

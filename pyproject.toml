@@ -1,7 +1,7 @@
 [project]
 name = "leela-saes"
 version = "0.1.0"
-description = "leela-saes repo for paper Tracing the Thought of a Grandmaster-level Chess-Playing Transformer."
+description = "Code for Tracing the Internal Computation of a Chess Transformer."
 dependencies = [
     "datasets>=3.0.2",
     "transformers>=4.46.0",
