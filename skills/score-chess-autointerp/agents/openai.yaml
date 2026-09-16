@@ -1,0 +1,4 @@
+interface:
+  display_name: "Score Chess Autointerp"
+  short_description: "Score chess feature consistency and complexity"
+  default_prompt: "Use $score-chess-autointerp to score activation consistency and complexity for exported chess features."

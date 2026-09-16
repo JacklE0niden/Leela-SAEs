@@ -13,17 +13,21 @@ import chess
 import numpy as np
 import torch
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 for _path in (REPO_ROOT, REPO_ROOT / "src", REPO_ROOT / "server"):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
-from server.constants import BT4_MODEL_NAME, get_bt4_sae_combo
-from server.circuits_service import create_graph_from_attribution, load_model_and_transcoders, run_attribution
-from lm_saes.circuit.graph_lc0 import Graph, compute_graph_scores
-from lm_saes.circuit.leela_board import LeelaBoard
-from src.chess_utils import get_feature_encoder_vector, get_feature_vector, get_move_from_model
-
+from chess_utils import get_feature_encoder_vector, get_feature_vector, get_move_from_model  # noqa: E402
+from lm_saes.circuit.graph_lc0 import Graph, compute_graph_scores  # noqa: E402
+from lm_saes.circuit.leela_board import LeelaBoard  # noqa: E402
+from server.circuit_trace_defaults import DEFAULT_VJP_BATCH_SIZE  # noqa: E402
+from server.circuits_service import (  # noqa: E402
+    create_graph_from_attribution,
+    load_model_and_transcoders,
+    run_attribution,
+)
+from server.constants import BT4_MODEL_NAME, get_bt4_sae_combo  # noqa: E402
 
 DEFAULT_SAE_SERIES = "BT4-exp128"
 
@@ -216,6 +220,7 @@ def build_graph_for_case(
     max_n_logits: int = 1,
     desired_logit_prob: float = 0.95,
     batch_size: int = 1,
+    vjp_batch_size: int = DEFAULT_VJP_BATCH_SIZE,
     order_mode: str = "positive",
     save_activation_info: bool = True,
 ) -> tuple[Graph, dict[str, Any], EvalCase]:
@@ -231,6 +236,7 @@ def build_graph_for_case(
         desired_logit_prob=desired_logit_prob,
         max_feature_nodes=max_feature_nodes,
         batch_size=batch_size,
+        vjp_batch_size=vjp_batch_size,
         order_mode=order_mode,
         mongo_client=None,
         sae_series=bundle.sae_series,

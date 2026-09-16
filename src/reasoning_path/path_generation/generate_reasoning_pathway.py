@@ -2,29 +2,27 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 from itertools import combinations
 from pathlib import Path
 from typing import Any, Optional
 
 import pandas as pd
 import torch
-from lm_saes import LowRankSparseAttention, SparseAutoEncoder
 from tqdm.auto import tqdm
 from transformer_lens import HookedTransformer
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.append(str(PROJECT_ROOT))
+from chess_utils import get_move_from_policy_output_with_prob
+from feature_and_steering import analyze_position_features_comprehensive
+from lm_saes import LowRankSparseAttention, SparseAutoEncoder
 
-from src.chess_utils import get_move_from_policy_output_with_prob
-from src.feature_and_steering import analyze_position_features_comprehensive
-from src.path_evaluation.feature_infl import (
+from ..path_evaluation.feature_infl import (
     build_feature_list_from_df,
     compute_cross_feature_list_interactions,
     compute_feature_list_interactions,
     precompute_activations_and_weights,
 )
+
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 DEFAULT_MODEL_NAME = "lc0/BT4-1024x15x32h"
 DEFAULT_DEVICE = "cuda"

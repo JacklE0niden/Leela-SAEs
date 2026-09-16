@@ -23,7 +23,7 @@ const router = createBrowserRouter([
     element: <SemanticSupernodeGraphPage />,
   },
   { path: "/interaction-circuit", element: <InteractionCircuitPage /> },
-  { path: "*", element: <Navigate to="/play-game" replace /> },
+  { path: "*", element: <Navigate to="/play-game#circuit-tracing" replace /> },
 ]);
 
 ReactDOM.createRoot(document.getElementById("root")!).render(

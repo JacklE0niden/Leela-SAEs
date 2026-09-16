@@ -6,7 +6,7 @@ const NAV_ITEMS = [
   ["/dictionaries", "Dictionaries"],
   ["/bookmarks", "Bookmarks"],
   ["/circuits", "Circuits"],
-  ["/play-game", "Play Game"],
+  ["/play-game#circuit-tracing", "Circuit Tracing"],
   ["/semantic-supernode-graph", "Semantic Supernode Graph"],
   ["/interaction-circuit", "Interaction Circuit"],
 ] as const;
@@ -26,7 +26,7 @@ export const AppNavbar = () => {
               key={to}
               className={cn(
                 "whitespace-nowrap text-sm text-foreground/60 transition-colors hover:text-foreground/80",
-                location.pathname === to && "font-medium text-foreground",
+                location.pathname === to.split("#")[0] && "font-medium text-foreground",
               )}
               to={to}
             >

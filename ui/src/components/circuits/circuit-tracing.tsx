@@ -994,7 +994,7 @@ export const CircuitTracing: React.FC<CircuitTracingProps> = ({
   }, [effectiveGameFen, positiveMove, negativeMove]);
 
   return (
-    <div className="space-y-6">
+    <div id="circuit-tracing" className="scroll-mt-4 space-y-6">
       {/* Circuit Trace control panel */}
       <Card>
         <CardHeader>

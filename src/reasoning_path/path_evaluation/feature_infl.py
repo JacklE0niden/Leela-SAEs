@@ -9,7 +9,7 @@ import pandas as pd
 import torch
 from tqdm.auto import tqdm
 
-from src.feature_and_steering.interact import analyze_node_activation_impact
+from feature_and_steering.interact import analyze_node_activation_impact
 
 
 FeatureNode = Tuple[int, int, int, str]

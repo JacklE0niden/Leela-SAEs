@@ -50,6 +50,7 @@ text = "MIT"
 
 [project.scripts]
 lm-saes = "lm_saes.entrypoint:entrypoint"
+circuit-trace = "lm_saes.circuit.cli:main"
 
 [dependency-groups]
 dev = [

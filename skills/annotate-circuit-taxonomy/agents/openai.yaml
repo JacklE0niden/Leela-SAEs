@@ -1,0 +1,4 @@
+interface:
+  display_name: "Annotate Circuit Taxonomy"
+  short_description: "Draft chess feature taxonomy labels"
+  default_prompt: "Use $annotate-circuit-taxonomy to draft reviewable taxonomy labels for pending circuit features."

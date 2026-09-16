@@ -1,12 +1,12 @@
 
-import chess
-import torch
-from transformer_lens import HookedTransformer
-from typing import Dict, List, Any, Optional, Tuple
 from collections import defaultdict
+from typing import Any, Dict, List, Optional, Tuple
+
+import torch
 from tqdm.auto import tqdm
-from src.chess_utils import get_feature_vector
-from src.chess_utils import get_move_from_policy_output_with_prob
+
+from chess_utils import get_feature_vector, get_move_from_policy_output_with_prob
+
 
 def collect_activated_features_at_position(
     pos_dict: Dict[str, int],

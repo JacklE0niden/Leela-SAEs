@@ -3,8 +3,8 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import os
 import math
+import os
 import random
 import statistics
 from collections.abc import Iterator, Sequence
@@ -17,14 +17,14 @@ import torch.nn.functional as F
 from safetensors.torch import load_file
 from transformer_lens import HookedTransformer
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-
-from ..chess_utils import (
+from chess_utils import (
     get_move_from_policy_output,
     get_move_from_policy_output_with_prob,
 )
-from ..lm_saes import LowRankSparseAttention, SparseAutoEncoder
-from ..lm_saes.config import LorsaConfig, SAEConfig
+from lm_saes import LowRankSparseAttention, SparseAutoEncoder
+from lm_saes.config import LorsaConfig, SAEConfig
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 ComponentKind = Literal["mlp", "attn"]
 

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Verify Chess Feature"
+  short_description: "Generate chess feature verification code"
+  default_prompt: "Use $verify-chess-feature to write Python verification code for this interpreted chess SAE feature."

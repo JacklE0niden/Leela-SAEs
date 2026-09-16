@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from path_generation.generate_reasoning_pathway import (
+from reasoning_path.path_generation import (
     DEFAULT_DEVICE,
     DEFAULT_LORSA_ROOT,
     DEFAULT_MODEL_NAME,
@@ -68,4 +68,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

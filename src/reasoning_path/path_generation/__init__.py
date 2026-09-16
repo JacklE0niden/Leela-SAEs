@@ -4,6 +4,7 @@ from .generate_reasoning_pathway import (
     DEFAULT_DEVICE,
     DEFAULT_LORSA_ROOT,
     DEFAULT_MODEL_NAME,
+    DEFAULT_SAE_ROOT,
     DEFAULT_TC_ROOT,
     generate_path_csvs,
 )
@@ -12,7 +13,7 @@ __all__ = [
     "DEFAULT_DEVICE",
     "DEFAULT_LORSA_ROOT",
     "DEFAULT_MODEL_NAME",
+    "DEFAULT_SAE_ROOT",
     "DEFAULT_TC_ROOT",
     "generate_path_csvs",
 ]
-

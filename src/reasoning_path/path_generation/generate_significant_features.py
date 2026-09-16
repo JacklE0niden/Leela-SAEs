@@ -2,7 +2,6 @@ from lm_saes import SparseAutoEncoder, LowRankSparseAttention
 from transformer_lens import HookedTransformer
 
 import torch
-import sys
 from pathlib import Path
 from collections import defaultdict
 import json
@@ -15,10 +14,10 @@ import traceback
 import os
 
 import chess
-project_root = Path(__file__).resolve().parents[2]
-sys.path.append(str(project_root))
-from src.chess_utils import get_move_from_policy_output_with_prob
-from src.feature_and_steering import analyze_position_features_comprehensive
+from chess_utils import get_move_from_policy_output_with_prob
+from feature_and_steering import analyze_position_features_comprehensive
+
+project_root = Path(__file__).resolve().parents[3]
 
 model_name = 'lc0/BT4-1024x15x32h'
 sae_root = Path(os.environ.get("BT4_SAE_ROOT", project_root / "result_BT4"))

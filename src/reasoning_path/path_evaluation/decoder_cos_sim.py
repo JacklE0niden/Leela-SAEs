@@ -1,17 +1,17 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from itertools import combinations
-from typing import Dict, List, Tuple, Optional
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import torch
-from lm_saes import SparseAutoEncoder, LowRankSparseAttention
+from chess_utils import get_feature_vector
+from lm_saes import LowRankSparseAttention, SparseAutoEncoder
 from tqdm.auto import tqdm
-from src.path_evaluation.apply_layernorm import apply_layernorm_path_with_feature_types
 
-from src.chess_utils import get_feature_vector
+from .apply_layernorm import apply_layernorm_path_with_feature_types
 
 
 def compute_decoder_cos_sim_single(

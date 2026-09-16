@@ -2,6 +2,43 @@
 
 This repository contains the code for experiments and analyses in **Tracing the Thought of a Grandmaster-level Chess-Playing Transformer**. Its primary workflow is **circuit tracing**: decompose an LC0/BT4 move into a sparse attribution graph over Transcoder and Lorsa features, inspect the graph, and optionally organize it into semantic supernodes.
 
+## Circuit tracing quickstart
+
+Circuit tracing has two supported entry points. Both use the same attribution implementation and produce graph JSON that can be reopened on the **Circuits** page.
+
+### WebUI (recommended)
+
+```bash
+uv sync
+cp server/.env.example server/.env
+cp ui/.env.example ui/.env
+uv run uvicorn server.app:app --host 0.0.0.0 --port 3000 --env-file server/.env
+```
+
+In a second terminal:
+
+```bash
+cd ui
+bun install
+bun run dev --port 5173
+```
+
+Open [http://localhost:5173/play-game#circuit-tracing](http://localhost:5173/play-game#circuit-tracing). The **Circuit Tracing** navigation item points to the tracing panel inside the Play page: load an SAE combo, enter or play to a position, provide a UCI move, and run a positive, negative, or paired trace.
+
+### Command line
+
+```bash
+uv run circuit-trace \
+  --fen 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1' \
+  --move e2e4 \
+  --combo k_30_e_16 \
+  --order-mode positive
+```
+
+The command writes a timestamped JSON file under `circuit_trace_results/`. Use `--output path/to/trace.json` to choose the destination. For a paired comparison, add `--order-mode both --negative-move <uci>`.
+
+Before tracing, provide the BT4 base checkpoint and one Transcoder/Lorsa combo as described in [Checkpoint layout](#1-prepare-the-checkpoints). Circuit tracing normally requires a CUDA GPU.
+
 
 ## Example: Reasoning Pathway of a Grandmaster-Level Movement by BT4
 
@@ -69,7 +106,7 @@ You still need the **BT4 base model** in TransformerLens format (`BT4.pt` under 
 
 ---
 
-## Quickstart (typical workflow)
+## Reasoning-pathway and training workflows (optional)
 
 ### A) Using pretrained HF checkpoints (primary)
 
@@ -88,7 +125,7 @@ Adjust `--tc-root` / `--lorsa-root` if your directories differ from the script d
 
 Use this path when you need **custom** Transcoders / Lorsa (hyperparameters, data, or ablations). Pretrained HF weights are still listed above for the common case.
 
-Relevant scripts live under `examples/` and `src/path_generation/`. You will likely need to edit model name, layer index, output paths, and other settings.
+Relevant scripts live under `examples/` and `src/reasoning_path/path_generation/`. You will likely need to edit model name, layer index, output paths, and other settings.
 
 #### BT4 base checkpoint from ONNX
 
@@ -191,7 +228,7 @@ cd ui
 bun run dev --port 5173
 ```
 
-Open <http://localhost:5173>. The root URL redirects to **Play Game**, the main circuit-tracing workflow.
+Open <http://localhost:5173/play-game#circuit-tracing>. The root URL redirects to the circuit-tracing panel in **Play Game**, which is also exposed as **Circuit Tracing** in the navigation bar.
 
 ### 3. Trace a move in the UI
 
@@ -247,7 +284,7 @@ Explore `examples/` for training and analysis patterns. **MongoDB** is recommend
 The paper-only intervention batch utility does not contain a built-in experiment directory list. Supply each input directory explicitly, repeating `--folder` as needed:
 
 ```bash
-python src/path_generation/generate_feature_interventions_from_json.py \
+python src/reasoning_path/path_generation/generate_feature_interventions_from_json.py \
   --folder outputs/experiment-a \
   --folder outputs/experiment-b \
   --top-n 400
@@ -255,7 +292,7 @@ python src/path_generation/generate_feature_interventions_from_json.py \
 
 ### Visualizing learned dictionaries and reasoning pathways
 
-Analysis results are stored in **MongoDB**. You can browse learned dictionaries and related analyses in the WebUI. The streamlined navigation contains only **Features**, **Dictionaries**, **Bookmarks**, **Circuits**, **Play Game**, **Semantic Supernode Graph**, and **Interaction Circuit**. Start the FastAPI backend with:
+Analysis results are stored in **MongoDB**. You can browse learned dictionaries and related analyses in the WebUI. The streamlined navigation contains only **Features**, **Dictionaries**, **Bookmarks**, **Circuits**, **Circuit Tracing**, **Semantic Supernode Graph**, and **Interaction Circuit**. Start the FastAPI backend with:
 
 ```bash
 uv run uvicorn server.app:app --host 0.0.0.0 --port 3000 --env-file server/.env
